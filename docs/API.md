@@ -53,6 +53,11 @@ Open paths (no auth needed): `/docs`, `/redoc`, `/openapi.json`, `/healthz`
 
 Standard OpenAI chat completion request.
 
+Every call starts a fresh provider browser chat. The request's `messages` array
+is the complete source of conversation context, so include all prior turns for
+a multi-turn conversation. Earlier API calls are never inherited implicitly,
+and you do not need to call `/thread/new` first.
+
 ```python
 from openai import OpenAI
 
@@ -384,7 +389,7 @@ In addition to the OpenAI-compatible endpoints, CatGPT exposes a simpler custom 
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/chat` | Send a message in the current conversation |
-| `POST` | `/thread/new` | Start a new conversation |
+| `POST` | `/thread/new` | Start a new conversation, send its first message, and wait for the response |
 | `POST` | `/thread/{id}/chat` | Send a message in a specific thread |
 | `GET` | `/threads` | List recent threads |
 | `GET` | `/status` | Health check, login status, current thread |
@@ -396,7 +401,7 @@ curl -X POST http://localhost:8000/chat \
   -H "Authorization: Bearer dummy123" \
   -d '{"message": "Hello!"}'
 
-# Start new thread
+# Start a new thread and wait for its first response
 curl -X POST http://localhost:8000/thread/new \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer dummy123" \

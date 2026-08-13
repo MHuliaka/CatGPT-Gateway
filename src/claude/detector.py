@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from time import monotonic
 
 from patchright.async_api import Page
 
@@ -206,6 +207,10 @@ async def wait_for_response_complete(
     """
     timeout = timeout_ms or Config.RESPONSE_TIMEOUT
     log.info(f"Waiting for response (timeout: {timeout}ms)...")
+    deadline = monotonic() + (timeout / 1000)
+
+    def remaining_timeout_ms() -> int:
+        return max(0, int((deadline - monotonic()) * 1000))
 
     pre_copy_count = await _count_copy_buttons(page)
     log.debug(f"Copy buttons before send: {pre_copy_count}")
@@ -213,11 +218,18 @@ async def wait_for_response_complete(
     # Wait for new turn to appear
     if previous_turn_signature:
         log.debug(f"Previous assistant turn signature: {previous_turn_signature}")
-        await _wait_for_new_turn_signature(page, previous_turn_signature, timeout_ms=30000)
+        turn_timeout = min(30000, remaining_timeout_ms())
+        if turn_timeout > 0:
+            await _wait_for_new_turn_signature(
+                page,
+                previous_turn_signature,
+                timeout_ms=turn_timeout,
+            )
     elif expected_msg_count is not None:
         log.debug(f"Waiting for assistant message #{expected_msg_count}...")
         waited = 0
-        while waited < 30000:
+        turn_timeout = min(30000, remaining_timeout_ms())
+        while waited < turn_timeout:
             current_count = await count_assistant_messages(page)
             if current_count >= expected_msg_count:
                 log.debug(f"Assistant message target reached (count: {current_count})")
@@ -227,14 +239,29 @@ async def wait_for_response_complete(
 
     # Strategy 1: Wait for streaming to complete (most reliable for Claude)
     log.debug("Waiting for streaming to complete (data-is-streaming='false')...")
-    completed = await _wait_for_streaming_complete(page, timeout, previous_turn_signature)
+    remaining = remaining_timeout_ms()
+    if remaining <= 0:
+        log.warning(f"Response did not complete within the total {timeout}ms timeout")
+        return False
+
+    completed = await _wait_for_streaming_complete(
+        page,
+        remaining,
+        previous_turn_signature,
+    )
     if completed:
         log.info("Response complete — streaming finished")
         return True
 
     # Strategy 2: Wait for copy button
     log.debug("Waiting for copy button on latest assistant turn...")
-    copy_detected = await _wait_for_copy_button(page, pre_copy_count, timeout, previous_turn_signature)
+    remaining = remaining_timeout_ms()
+    copy_detected = remaining > 0 and await _wait_for_copy_button(
+        page,
+        pre_copy_count,
+        remaining,
+        previous_turn_signature,
+    )
     if copy_detected:
         log.info("Response complete — copy button appeared on latest turn")
         return True
@@ -242,7 +269,15 @@ async def wait_for_response_complete(
     # Strategy 3: Text stability fallback
     log.info("Falling back to text-stability detection...")
     try:
-        return await _wait_via_text_stability(page, timeout, previous_turn_signature)
+        remaining = remaining_timeout_ms()
+        if remaining <= 0:
+            log.warning(f"Response did not complete within the total {timeout}ms timeout")
+            return False
+        return await _wait_via_text_stability(
+            page,
+            remaining,
+            previous_turn_signature,
+        )
     except Exception as e:
         log.error(f"All strategies failed: {e}")
         return False

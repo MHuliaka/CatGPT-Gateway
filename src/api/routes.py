@@ -15,6 +15,7 @@ import asyncio
 
 from fastapi import APIRouter, HTTPException
 
+from src.api.chat_lifecycle import NewChatTimeoutError, start_new_chat
 from src.api.schemas import (
     ChatRequest,
     ChatResponse,
@@ -123,9 +124,15 @@ async def new_thread(req: ChatRequest) -> ChatResponse:
 
     async with _lock:
         try:
-            await client.new_chat()
+            await start_new_chat(client)
             result = await client.send_message(req.message)
             return _build_response(result)
+        except NewChatTimeoutError as e:
+            log.error(f"New thread timed out: {e}")
+            raise HTTPException(status_code=504, detail=str(e)) from e
+        except TimeoutError as e:
+            log.error(f"New thread response timed out: {e}")
+            raise HTTPException(status_code=504, detail=str(e)) from e
         except Exception as e:
             log.error(f"New thread error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))

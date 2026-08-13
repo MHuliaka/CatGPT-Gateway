@@ -132,13 +132,11 @@ class MiniMaxProviderTests(unittest.TestCase):
         )
         previous_client = openai_routes._client
         previous_lock = openai_routes._lock
-        previous_count = openai_routes._thread_message_count
         previous_response_time = openai_routes._last_response_time
 
         try:
             openai_routes._client = client
             openai_routes._lock = None
-            openai_routes._thread_message_count = 0
             openai_routes._last_response_time = 0.0
             with patch.object(Config, "PROVIDER", "minimax"):
                 response = asyncio.run(
@@ -150,7 +148,6 @@ class MiniMaxProviderTests(unittest.TestCase):
         finally:
             openai_routes._client = previous_client
             openai_routes._lock = previous_lock
-            openai_routes._thread_message_count = previous_count
             openai_routes._last_response_time = previous_response_time
 
     def test_openai_requests_start_with_isolated_provider_history(self) -> None:
@@ -158,13 +155,11 @@ class MiniMaxProviderTests(unittest.TestCase):
         client = MiniMaxClient(api_key="test-key", opener=opener)
         previous_client = openai_routes._client
         previous_lock = openai_routes._lock
-        previous_count = openai_routes._thread_message_count
         previous_response_time = openai_routes._last_response_time
 
         try:
             openai_routes._client = client
             openai_routes._lock = None
-            openai_routes._thread_message_count = 0
             openai_routes._last_response_time = 0.0
             with patch.object(Config, "PROVIDER", "minimax"):
                 asyncio.run(
@@ -191,7 +186,6 @@ class MiniMaxProviderTests(unittest.TestCase):
         finally:
             openai_routes._client = previous_client
             openai_routes._lock = previous_lock
-            openai_routes._thread_message_count = previous_count
             openai_routes._last_response_time = previous_response_time
 
     def test_chat_route_rejects_minimax_attachments_before_provider(self) -> None:

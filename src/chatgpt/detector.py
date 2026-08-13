@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from time import monotonic
 
 from patchright.async_api import Page
 from patchright._impl._errors import TargetClosedError
@@ -267,17 +268,28 @@ async def wait_for_response_complete(
     """
     timeout = timeout_ms or Config.RESPONSE_TIMEOUT
     log.info(f"Waiting for response (timeout: {timeout}ms)...")
+    deadline = monotonic() + (timeout / 1000)
+
+    def remaining_timeout_ms() -> int:
+        return max(0, int((deadline - monotonic()) * 1000))
 
     pre_copy_count = await _count_copy_buttons(page)
     log.debug(f"Copy buttons before send: {pre_copy_count}")
 
     if previous_turn_signature:
         log.debug(f"Previous assistant turn signature: {previous_turn_signature}")
-        await _wait_for_new_turn_signature(page, previous_turn_signature, timeout_ms=30000)
+        turn_timeout = min(30000, remaining_timeout_ms())
+        if turn_timeout > 0:
+            await _wait_for_new_turn_signature(
+                page,
+                previous_turn_signature,
+                timeout_ms=turn_timeout,
+            )
     elif expected_msg_count is not None:
         log.debug(f"Waiting for assistant message #{expected_msg_count}...")
         waited = 0
-        while waited < 30000:
+        turn_timeout = min(30000, remaining_timeout_ms())
+        while waited < turn_timeout:
             current_count = await count_assistant_messages(page)
             if current_count >= expected_msg_count:
                 log.debug(f"Assistant message target reached (count: {current_count})")
@@ -286,7 +298,16 @@ async def wait_for_response_complete(
             waited += 500
 
     log.debug("Waiting for copy button or image on latest assistant turn...")
-    completed = await _wait_for_copy_button_or_image(page, timeout, previous_turn_signature)
+    remaining = remaining_timeout_ms()
+    if remaining <= 0:
+        log.warning(f"Response did not complete within the total {timeout}ms timeout")
+        return False
+
+    completed = await _wait_for_copy_button_or_image(
+        page,
+        remaining,
+        previous_turn_signature,
+    )
     if completed == "copy":
         log.info("Response complete — copy button appeared on latest turn")
         return True
@@ -296,7 +317,8 @@ async def wait_for_response_complete(
 
     log.info("Copy/image completion not detected, trying stop-button strategy...")
     try:
-        result = await _wait_via_stop_button(page, timeout)
+        remaining = remaining_timeout_ms()
+        result = remaining > 0 and await _wait_via_stop_button(page, remaining)
         if result:
             return True
     except Exception as e:
@@ -304,7 +326,15 @@ async def wait_for_response_complete(
 
     log.info("Falling back to text-stability detection...")
     try:
-        return await _wait_via_text_stability(page, timeout, previous_turn_signature)
+        remaining = remaining_timeout_ms()
+        if remaining <= 0:
+            log.warning(f"Response did not complete within the total {timeout}ms timeout")
+            return False
+        return await _wait_via_text_stability(
+            page,
+            remaining,
+            previous_turn_signature,
+        )
     except Exception as e:
         log.error(f"All strategies failed: {e}")
         return False
@@ -437,10 +467,15 @@ async def _wait_for_copy_button_or_image(
 async def _wait_via_stop_button(page: Page, timeout_ms: int) -> bool:
     """Wait for stop button appear -> disappear cycle."""
     stop_selector = ", ".join(Selectors.STOP_BUTTON)
+    deadline = monotonic() + (timeout_ms / 1000)
     log.debug("Waiting for stop button to appear...")
 
     try:
-        await page.wait_for_selector(stop_selector, state="visible", timeout=15000)
+        await page.wait_for_selector(
+            stop_selector,
+            state="visible",
+            timeout=min(15000, timeout_ms),
+        )
         log.info("Stop button appeared — response is streaming")
     except Exception:
         log.debug("Stop button never appeared (short response or selector changed)")
@@ -448,19 +483,23 @@ async def _wait_via_stop_button(page: Page, timeout_ms: int) -> bool:
 
     log.debug("Waiting for stop button to disappear...")
     heartbeat_interval = 10
-    elapsed = 0
 
-    while elapsed * 1000 < timeout_ms:
+    while monotonic() < deadline:
+        remaining_ms = max(1, int((deadline - monotonic()) * 1000))
         try:
-            await page.wait_for_selector(stop_selector, state="hidden", timeout=heartbeat_interval * 1000)
+            await page.wait_for_selector(
+                stop_selector,
+                state="hidden",
+                timeout=min(heartbeat_interval * 1000, remaining_ms),
+            )
             log.info("Stop button disappeared — streaming done")
             return True
         except Exception:
-            elapsed += heartbeat_interval
-            log.debug(f"Still streaming... ({elapsed}s elapsed)")
+            elapsed = (timeout_ms / 1000) - max(0, deadline - monotonic())
+            log.debug(f"Still streaming... ({elapsed:.0f}s elapsed)")
             await idle_mouse_movement(page)
 
-    log.warning(f"Timed out after {elapsed}s waiting for stop button")
+    log.warning(f"Timed out waiting for stop button after {timeout_ms / 1000:g}s")
     return False
 
 

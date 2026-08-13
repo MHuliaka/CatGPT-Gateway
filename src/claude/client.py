@@ -124,16 +124,13 @@ class ClaudeClient:
             previous_turn_signature=pre_turn_signature,
         )
 
-        # If we only captured a transient status, retry
+        # If we only captured a transient status, briefly retry extraction.
+        # The detector already spent the configured total response budget, so
+        # do not start additional 90-second waits here.
         if is_incomplete_response_text(response_text):
             log.warning("Extracted text looks incomplete/transient; retrying for final answer")
             for attempt in range(1, 3):
                 await asyncio.sleep(4)
-                await wait_for_response_complete(
-                    self._page,
-                    timeout_ms=90000,
-                    previous_turn_signature=pre_turn_signature,
-                )
                 retry_text = await extract_last_response_via_copy(
                     self._page,
                     previous_turn_signature=pre_turn_signature,
@@ -147,6 +144,11 @@ class ClaudeClient:
                 if retry_text:
                     response_text = retry_text
                 log.warning(f"Retry {attempt} still incomplete/transient")
+
+            if is_incomplete_response_text(response_text):
+                raise TimeoutError(
+                    "Claude response did not complete within the configured timeout"
+                )
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         thread_id = self._extract_thread_id()
@@ -170,17 +172,26 @@ class ClaudeClient:
         """Start a new conversation by navigating to /new."""
         log.info("Starting new chat...")
         url = Config.CLAUDE_URL.rstrip("/") + "/new"
-        await self._page.goto(url, wait_until="domcontentloaded")
+        await self._page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=Config.NEW_CHAT_TIMEOUT,
+        )
         await asyncio.sleep(1.5)
 
         # Wait for the chat input to be visible
-        for selector in ClaudeSelectors.CHAT_INPUT:
-            try:
-                await self._page.wait_for_selector(selector, timeout=10000, state="visible")
-                log.debug(f"Chat input ready: {selector}")
-                break
-            except Exception:
-                continue
+        selector = ", ".join(ClaudeSelectors.CHAT_INPUT)
+        try:
+            await self._page.wait_for_selector(
+                selector,
+                timeout=Config.SELECTOR_TIMEOUT,
+                state="visible",
+            )
+            log.debug("Chat input ready")
+        except Exception as exc:
+            raise RuntimeError(
+                "New chat opened without an interactive chat input"
+            ) from exc
 
         await random_delay(300, 600)
         log.info("New chat started (navigated to /new)")

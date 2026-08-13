@@ -147,6 +147,13 @@ python -m src.api.server
 
 Once the server is running, you can use it with any OpenAI-compatible client.
 
+Each OpenAI-compatible generation request starts in a fresh browser chat. For
+a multi-turn conversation, send the complete conversation history in
+`messages`, as the OpenAI API expects. This prevents context from an earlier API
+call leaking into a later one. The custom `/chat` and `/thread/{id}/chat`
+endpoints remain stateful for callers that explicitly want to continue a
+browser thread.
+
 ### Python (OpenAI SDK)
 
 ```python
@@ -257,6 +264,7 @@ Key settings:
 | `API_TOKEN` | `dummy123` | Bearer token for API authentication |
 | `API_PORT` | `8000` | Port the API server listens on |
 | `HEADLESS` | `false` | Run browser without display (not recommended) |
+| `NEW_CHAT_TIMEOUT` | `30000` | Maximum milliseconds allowed to open the isolated browser chat |
 
 > See [.env.example](.env.example) for all available settings with descriptions.
 
@@ -315,6 +323,7 @@ Tool calling is implemented via prompt engineering: tool definitions are injecte
 - **No streaming** - Responses are returned all at once after completion. `stream=true` returns a 400 error.
 - **Single concurrency** - One request at a time (browser is single-threaded). Requests are queued.
 - **Response time** - Each request takes 5-30s depending on response length (real browser round-trip).
+- **Fresh browser chat per OpenAI generation request** - Multi-turn context must be included in the request's `messages` array.
 - **Session expiry** - Browser sessions expire after days/weeks. Re-login via noVNC or `first_login.py`.
 - **UI changes** - If Claude or ChatGPT update their HTML, selectors may need updating. All selectors are centralized in `selectors.py` for easy fixes.
 - **Tool calling** - Works via prompt engineering, not native API. Reliable for 1-7 tools. Very complex schemas may occasionally need a retry.

@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
+from src.api.chat_lifecycle import NewChatTimeoutError, start_new_chat
 from src.api.openai_schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -70,30 +71,24 @@ def _get_lock() -> asyncio.Lock:
     return _lock
 
 
-# Track messages in the current thread to prevent thread exhaustion
-_thread_message_count = 0
-_MAX_THREAD_MESSAGES = 8  # Start a new chat after this many requests
 _last_response_time: float = 0.0
 _MIN_MESSAGE_GAP = 3.0  # Minimum seconds between messages (ChatGPT needs cooldown)
 
 
 async def _ensure_fresh_chat() -> None:
-    """Enforce cooldown between messages and start new chat if thread is full.
+    """Start an isolated browser chat for every OpenAI-compatible request.
 
-    ChatGPT's web UI degrades after ~6-8 messages in a thread (stops
-    generating, copy-button never appears). We preemptively start a
-    new chat after _MAX_THREAD_MESSAGES to prevent this.
-
-    Also enforces a minimum gap between consecutive messages, since
-    ChatGPT's UI may not accept rapid-fire messages properly.
+    OpenAI requests carry their complete conversation in ``messages``. The
+    browser chat is only a transport and must not retain context from an
+    earlier API call. A short cooldown is still enforced because the provider
+    UI may reject rapid-fire submissions.
     """
-    global _thread_message_count, _last_response_time
+    global _last_response_time
 
-    # API-backed providers do not need browser cooldowns or thread rotation.
+    # API-backed providers do not need browser cooldowns or chat resets.
     # Their OpenAI-compatible calls are made statelessly below because each
     # request already carries its complete conversation history.
     if not Config.uses_browser():
-        _thread_message_count = 0
         return
 
     # Enforce minimum gap between messages
@@ -104,31 +99,26 @@ async def _ensure_fresh_chat() -> None:
             log.debug(f"Cooldown: waiting {wait:.1f}s before next message")
             await asyncio.sleep(wait)
 
-    if _thread_message_count < _MAX_THREAD_MESSAGES:
-        return  # Thread is fresh enough — no navigation needed
-
     client = _get_client()
     try:
-        await client.new_chat()
-        _thread_message_count = 0
-    except Exception as e:
-        log.warning(f"new_chat() failed, retrying once: {e}")
-        try:
-            await asyncio.sleep(2)
-            await client.new_chat()
-            _thread_message_count = 0
-        except Exception as e2:
-            log.error(f"new_chat() retry also failed: {e2}")
-            # Don't raise — continue with current thread rather than failing
-            log.warning("Continuing with current thread despite new_chat failure")
+        await start_new_chat(client)
+    except NewChatTimeoutError as exc:
+        log.error(str(exc))
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except Exception as exc:
+        log.error(f"Could not start an isolated browser chat: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not start an isolated browser chat: {exc}",
+        ) from exc
 
 
-def _increment_thread_count() -> None:
-    """Increment the thread message counter after a successful response."""
-    global _thread_message_count, _last_response_time
-    _thread_message_count += 1
+def _record_response_time() -> None:
+    """Record a successful browser response for the inter-request cooldown."""
+    global _last_response_time
+    if not Config.uses_browser():
+        return
     _last_response_time = time.time()
-    log.debug(f"Thread message count: {_thread_message_count}/{_MAX_THREAD_MESSAGES}")
 
 
 def _resolve_model_id(requested: str | None) -> str:
@@ -686,7 +676,7 @@ async def create_image(
             f"n={request.n}, size={request.size}, response_format={request.response_format}"
         )
 
-        # Start a fresh conversation to avoid thread exhaustion
+        # Isolate this OpenAI request from every previous browser chat
         await _ensure_fresh_chat()
 
         # Send to ChatGPT
@@ -756,7 +746,7 @@ async def create_image(
             f"{elapsed_ms}ms, format={request.response_format}"
         )
 
-        _increment_thread_count()
+        _record_response_time()
         return ImagesResponse(data=image_data_list)
 
 
@@ -837,7 +827,7 @@ async def create_chat_completion(
         if all_attachment_paths:
             log.info(f"Extracted {len(image_paths)} image(s) and {len(file_paths)} file(s) from request")
 
-        # Start a fresh conversation to avoid thread exhaustion
+        # Isolate this OpenAI request from every previous browser chat
         await _ensure_fresh_chat()
 
         # ── Send to provider ───────────────────────────────
@@ -849,6 +839,12 @@ async def create_chat_completion(
                 model=model_id,
                 stateless=not Config.uses_browser(),
             )
+        except TimeoutError as e:
+            log.error(f"Provider response timed out: {e}")
+            raise HTTPException(
+                status_code=504,
+                detail=f"Provider response timed out: {e}",
+            ) from e
         except Exception as e:
             log.error(f"Provider error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Provider error: {str(e)}")
@@ -926,7 +922,7 @@ async def create_chat_completion(
             f"tokens≈{response.usage.total_tokens}"
         )
 
-        _increment_thread_count()
+        _record_response_time()
         return response
 
 
@@ -1316,7 +1312,7 @@ async def create_response(request: ResponsesRequest):
             f"prompt={len(prompt)} chars, stream={request.stream}"
         )
 
-        # Start a fresh conversation to avoid thread exhaustion
+        # Isolate this OpenAI request from every previous browser chat
         await _ensure_fresh_chat()
 
         # ── Send to provider ───────────────────────────────
@@ -1453,7 +1449,7 @@ async def create_response(request: ResponsesRequest):
             f"tokens≈{resp.usage.total_tokens if resp.usage else 0}"
         )
 
-        _increment_thread_count()
+        _record_response_time()
 
         # ── Stream or return ────────────────────────────────
         if request.stream:

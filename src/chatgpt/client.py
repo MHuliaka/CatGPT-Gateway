@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from urllib.parse import urlparse
 
 from patchright.async_api import Page
 
@@ -240,16 +241,13 @@ class ChatGPTClient:
                         break
 
             # If we only captured a transient status (e.g. "Pro thinking"),
-            # keep waiting and retry extraction on the same new turn.
+            # briefly retry extraction on the same turn. The detector already
+            # spent the configured total response budget, so starting another
+            # 90-second wait here could turn one request into a 10-minute hang.
             if is_incomplete_response_text(response_text):
                 log.warning("Extracted text looks incomplete/transient; retrying for final answer")
                 for attempt in range(1, 3):
                     await asyncio.sleep(2)
-                    await wait_for_response_complete(
-                        self._page,
-                        timeout_ms=90000,
-                        previous_turn_signature=pre_turn_signature,
-                    )
                     retry_text = await extract_last_response_via_copy(
                         self._page,
                         previous_turn_signature=pre_turn_signature,
@@ -263,6 +261,11 @@ class ChatGPTClient:
                     if retry_text:
                         response_text = retry_text
                     log.warning(f"Retry {attempt} still incomplete/transient")
+
+                if is_incomplete_response_text(response_text):
+                    raise TimeoutError(
+                        "ChatGPT response did not complete within the configured timeout"
+                    )
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         thread_id = self._extract_thread_id()
@@ -291,17 +294,12 @@ class ChatGPTClient:
         2. JavaScript location change (no DNS lookup needed if page is loaded)
         3. Full page.goto() (last resort — may fail with DNS errors)
         """
-        # Already on a fresh chat — nothing to do
-        if "chatgpt.com" in self._page.url:
-            try:
-                turn_count = await self._page.evaluate(
-                    "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
-                )
-                if turn_count == 0:
-                    log.info("Already on a fresh chat — skipping navigation")
-                    return
-            except Exception:
-                pass
+        # Only skip navigation when both the URL and DOM prove this is fresh.
+        # Checking the turn selector alone is unsafe: if ChatGPT renames that
+        # selector it returns zero even while the page is still on /c/{id}.
+        if await self._is_fresh_chat():
+            log.info("Already on a fresh chat — skipping navigation")
+            return
 
         # Strategy 1: SPA button click
         for selector in Selectors.NEW_CHAT_BUTTON:
@@ -311,16 +309,9 @@ class ChatGPTClient:
                     await btn.click()
                     log.info(f"New chat via SPA button: {selector}")
                     await asyncio.sleep(1)
-                    # Verify we're on a fresh chat
-                    try:
-                        turn_count = await self._page.evaluate(
-                            "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
-                        )
-                        if turn_count == 0:
-                            await self._wait_for_chat_input()
-                            return
-                    except Exception:
-                        pass
+                    if await self._is_fresh_chat():
+                        await self._wait_for_chat_input()
+                        return
             except Exception:
                 continue
 
@@ -330,7 +321,7 @@ class ChatGPTClient:
             await self._page.evaluate("window.location.href = '/'")
             await self._page.wait_for_load_state("domcontentloaded", timeout=15000)
             page_error = await self._detect_page_error()
-            if not page_error:
+            if not page_error and await self._is_fresh_chat():
                 log.info("New chat started (JS navigation)")
                 await self._wait_for_chat_input()
                 return
@@ -362,22 +353,62 @@ class ChatGPTClient:
                     continue
                 raise RuntimeError(f"Page error persists after {max_attempts} attempts: {page_error}")
 
+            if not await self._is_fresh_chat():
+                log.warning(f"Chat was not fresh after goto (attempt {attempt})")
+                if attempt < max_attempts:
+                    await asyncio.sleep(attempt * 3)
+                    continue
+                raise RuntimeError("Provider did not open an isolated new chat")
+
             log.info("New chat started (page.goto)")
             await self._wait_for_chat_input()
             return
 
+    async def _is_fresh_chat(self) -> bool:
+        """Return true only when URL and DOM both show an empty chat."""
+        current_url = urlparse(self._page.url)
+        target_url = urlparse(Config.CHATGPT_URL)
+        if (
+            current_url.scheme not in {"http", "https"}
+            or current_url.netloc != target_url.netloc
+        ):
+            return False
+
+        if self._extract_thread_id():
+            return False
+
+        try:
+            turn_count = await self._page.evaluate(
+                """
+                () => document.querySelectorAll([
+                    '[data-testid^="conversation-turn-"]',
+                    '[data-message-author-role="user"]',
+                    '[data-message-author-role="assistant"]',
+                    'section[data-turn="user"]',
+                    'section[data-turn="assistant"]'
+                ].join(',')).length
+                """
+            )
+            return turn_count == 0
+        except Exception:
+            # An unverifiable page must never be treated as isolated.
+            return False
+
     async def _wait_for_chat_input(self) -> None:
         """Wait for the chat input to become visible and interactive."""
-        for selector in Selectors.CHAT_INPUT:
-            try:
-                await self._page.wait_for_selector(selector, timeout=10000, state="visible")
-                log.debug(f"Chat input ready: {selector}")
-                # Brief settle for React handlers to attach
-                await asyncio.sleep(0.5)
-                return
-            except Exception:
-                continue
-        log.warning("Chat input not found — page may not be fully ready")
+        selector = ", ".join(Selectors.CHAT_INPUT)
+        try:
+            await self._page.wait_for_selector(
+                selector,
+                timeout=Config.SELECTOR_TIMEOUT,
+                state="visible",
+            )
+            log.debug("Chat input ready")
+            # Brief settle for React handlers to attach
+            await asyncio.sleep(0.5)
+        except Exception:
+            log.warning("Chat input not found — page may not be fully ready")
+            raise RuntimeError("New chat opened without an interactive chat input")
 
     async def _detect_page_error(self) -> str | None:
         """Check if the current page shows a browser or ChatGPT error."""

@@ -158,6 +158,7 @@ class Config:
     # Timeouts (ms)
     RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "120000"))
     SELECTOR_TIMEOUT: int = int(os.getenv("SELECTOR_TIMEOUT", "10000"))
+    NEW_CHAT_TIMEOUT: int = int(os.getenv("NEW_CHAT_TIMEOUT", "30000"))
 
     # Human simulation (ms)
     TYPING_SPEED_MIN: int = int(os.getenv("TYPING_SPEED_MIN", "50"))
