@@ -154,10 +154,10 @@ call leaking into a later one. The custom `/chat` and `/thread/{id}/chat`
 endpoints remain stateful for callers that explicitly want to continue a
 browser thread.
 
-For browser-backed providers, after a successful `/v1/chat/completions`
-response is sent to the caller, the provider page is refreshed in the
-background. Browser access remains locked during that refresh, so the next
-queued request starts only after the page is ready again.
+For browser-backed providers, `/v1/chat/completions` first captures the model
+response, waits 3 seconds, refreshes the provider page, and only then returns
+the saved response to the caller. Browser access remains locked throughout
+that sequence.
 
 ### Python (OpenAI SDK)
 
@@ -270,6 +270,7 @@ Key settings:
 | `API_PORT` | `8000` | Port the API server listens on |
 | `HEADLESS` | `false` | Run browser without display (not recommended) |
 | `NEW_CHAT_TIMEOUT` | `30000` | Overall new-chat safety limit; individual navigation and refresh attempts use shorter bounds |
+| `POST_RESPONSE_REFRESH_DELAY_SECONDS` | `3` | Delay after capturing a response and before refreshing; the API responds after refresh |
 
 > See [.env.example](.env.example) for all available settings with descriptions.
 

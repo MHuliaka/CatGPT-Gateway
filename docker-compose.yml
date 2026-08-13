@@ -58,6 +58,9 @@ services:
       # Timeouts
       - RESPONSE_TIMEOUT=120000
       - SELECTOR_TIMEOUT=10000
+      - NEW_CHAT_TIMEOUT=30000
+      # Capture response, wait this many seconds, refresh, then return it
+      - POST_RESPONSE_REFRESH_DELAY_SECONDS=3
 
       # Human simulation
       - TYPING_SPEED_MIN=50
