@@ -62,6 +62,10 @@ For browser-backed providers, once the response body has been sent, the gateway
 refreshes the provider page as background cleanup. A queued browser request
 waits for that refresh to finish before it proceeds.
 
+Fresh-chat navigation uses several short attempts rather than one 30-second UI
+action, so a stale or changed new-chat control cannot consume the entire reset
+budget before navigation fallbacks run.
+
 ```python
 from openai import OpenAI
 

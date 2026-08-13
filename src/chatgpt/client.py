@@ -290,79 +290,138 @@ class ChatGPTClient:
         """Start a new conversation.
 
         Strategy order:
-        1. SPA button click (avoids DNS issues, preserves browser state)
-        2. JavaScript location change (no DNS lookup needed if page is loaded)
-        3. Full page.goto() (last resort — may fail with DNS errors)
+        1. Immediate DOM click on ChatGPT's SPA new-chat control
+        2. JavaScript navigation to the site root
+        3. Short full navigation waiting only for the response to commit
+
+        Each strategy has its own small budget. This is important because a
+        regular Playwright click can otherwise spend the entire default
+        30-second timeout waiting for actionability or navigation, preventing
+        every fallback below it from running.
         """
-        # Only skip navigation when both the URL and DOM prove this is fresh.
-        # Checking the turn selector alone is unsafe: if ChatGPT renames that
-        # selector it returns zero even while the page is still on /c/{id}.
-        if await self._is_fresh_chat():
+        if await self._wait_for_fresh_chat(timeout_ms=1000):
             log.info("Already on a fresh chat — skipping navigation")
             return
 
-        # Strategy 1: SPA button click
-        for selector in Selectors.NEW_CHAT_BUTTON:
-            try:
-                btn = await self._page.query_selector(selector)
-                if btn and await btn.is_visible():
-                    await btn.click()
-                    log.info(f"New chat via SPA button: {selector}")
-                    await asyncio.sleep(1)
-                    if await self._is_fresh_chat():
-                        await self._wait_for_chat_input()
-                        return
-            except Exception:
-                continue
+        # Strategy 1: invoke the DOM click directly. Unlike ElementHandle.click,
+        # this returns immediately and does not inherit Playwright's 30s wait.
+        clicked_selector = None
+        try:
+            clicked_selector = await asyncio.wait_for(
+                self._page.evaluate(
+                    """
+                    (selectors) => {
+                        for (const selector of selectors) {
+                            for (const element of document.querySelectorAll(selector)) {
+                                const style = window.getComputedStyle(element);
+                                const rect = element.getBoundingClientRect();
+                                const visible = style.display !== 'none' &&
+                                    style.visibility !== 'hidden' &&
+                                    rect.width > 0 && rect.height > 0;
+                                if (visible) {
+                                    element.click();
+                                    return selector;
+                                }
+                            }
+                        }
+                        return null;
+                    }
+                    """,
+                    Selectors.NEW_CHAT_BUTTON,
+                ),
+                timeout=1.5,
+            )
+        except Exception as exc:
+            log.debug(f"Fast new-chat click failed: {exc}")
 
-        # Strategy 2: JavaScript navigation (avoids DNS lookup)
+        if clicked_selector:
+            log.info(f"New chat via fast SPA click: {clicked_selector}")
+            if await self._wait_for_fresh_chat(timeout_ms=4000):
+                return
+            log.warning("SPA new-chat click did not produce a ready empty chat")
+
+        # Strategy 2: start navigation without waiting for a load event. A
+        # readiness poll below decides when the new composer is actually usable.
         try:
             log.info("New chat via JS navigation...")
-            await self._page.evaluate("window.location.href = '/'")
-            await self._page.wait_for_load_state("domcontentloaded", timeout=15000)
-            page_error = await self._detect_page_error()
-            if not page_error and await self._is_fresh_chat():
-                log.info("New chat started (JS navigation)")
-                await self._wait_for_chat_input()
-                return
-        except Exception as e:
-            log.warning(f"JS navigation failed: {e}")
+            await asyncio.wait_for(
+                self._page.evaluate(
+                    "() => window.location.assign(new URL('/', window.location.origin).href)"
+                ),
+                timeout=1.5,
+            )
+        except Exception as exc:
+            # Navigation often destroys the execution context before evaluate()
+            # resolves. Still poll because the navigation may have started.
+            log.debug(f"JS navigation returned an error: {exc}")
 
-        # Strategy 3: Full page.goto() — last resort
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            log.info(f"New chat via page.goto (attempt {attempt}/{max_attempts})...")
-            try:
-                await self._page.goto(
-                    Config.CHATGPT_URL,
-                    wait_until="domcontentloaded",
-                    timeout=30000,
-                )
-            except Exception as e:
-                log.warning(f"page.goto failed (attempt {attempt}): {e}")
-                if attempt < max_attempts:
-                    await asyncio.sleep(attempt * 3)
-                    continue
-                raise
-
-            page_error = await self._detect_page_error()
-            if page_error:
-                log.error(f"Page error after goto (attempt {attempt}): {page_error}")
-                if attempt < max_attempts:
-                    await asyncio.sleep(attempt * 3)
-                    continue
-                raise RuntimeError(f"Page error persists after {max_attempts} attempts: {page_error}")
-
-            if not await self._is_fresh_chat():
-                log.warning(f"Chat was not fresh after goto (attempt {attempt})")
-                if attempt < max_attempts:
-                    await asyncio.sleep(attempt * 3)
-                    continue
-                raise RuntimeError("Provider did not open an isolated new chat")
-
-            log.info("New chat started (page.goto)")
-            await self._wait_for_chat_input()
+        if await self._wait_for_fresh_chat(timeout_ms=5000):
+            log.info("New chat started (JS navigation)")
             return
+
+        # Strategy 3: wait only for the HTTP response to commit. Waiting for
+        # DOMContentLoaded is unnecessary and is the common source of long hangs.
+        try:
+            log.info("New chat via short page.goto fallback...")
+            await self._page.goto(
+                Config.CHATGPT_URL,
+                wait_until="commit",
+                timeout=min(max(Config.NEW_CHAT_TIMEOUT, 1000), 7000),
+            )
+        except Exception as exc:
+            log.warning(f"Short page.goto fallback returned an error: {exc}")
+
+        if await self._wait_for_fresh_chat(timeout_ms=5000):
+            log.info("New chat started (short page.goto)")
+            return
+
+        try:
+            page_error = await asyncio.wait_for(
+                self._detect_page_error(),
+                timeout=1.0,
+            )
+        except Exception:
+            page_error = None
+        if page_error:
+            raise RuntimeError(f"Could not start a new chat: {page_error}")
+        raise RuntimeError(
+            f"Provider did not open an isolated new chat (current URL: {self._page.url})"
+        )
+
+    async def _wait_for_fresh_chat(self, timeout_ms: int) -> bool:
+        """Wait briefly for an empty chat with a visible composer."""
+        deadline = time.monotonic() + (max(timeout_ms, 1) / 1000)
+        input_selector = ", ".join(Selectors.CHAT_INPUT)
+
+        while time.monotonic() < deadline:
+            remaining_seconds = max(0.001, deadline - time.monotonic())
+            try:
+                fresh = await asyncio.wait_for(
+                    self._is_fresh_chat(),
+                    timeout=min(1.0, remaining_seconds),
+                )
+            except Exception:
+                fresh = False
+
+            if fresh:
+                remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                try:
+                    composer = await self._page.wait_for_selector(
+                        input_selector,
+                        timeout=min(750, remaining_ms),
+                        state="visible",
+                    )
+                    if composer:
+                        await asyncio.sleep(0.2)
+                        return True
+                except Exception:
+                    pass
+
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds > 0:
+                await asyncio.sleep(min(0.2, remaining_seconds))
+
+        return False
 
     async def _is_fresh_chat(self) -> bool:
         """Return true only when URL and DOM both show an empty chat."""

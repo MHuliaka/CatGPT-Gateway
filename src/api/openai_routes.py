@@ -123,15 +123,27 @@ def _record_response_time() -> None:
 
 async def _refresh_browser_page(client: ChatGPTClient | ClaudeClient) -> None:
     """Reload the provider page after its API response has been delivered."""
+    refresh_timeout_ms = min(max(Config.NEW_CHAT_TIMEOUT, 1000), 8000)
     try:
         await asyncio.wait_for(
             client.page.reload(
-                wait_until="domcontentloaded",
-                timeout=Config.NEW_CHAT_TIMEOUT,
+                # A committed response proves the refresh started. Waiting for
+                # DOMContentLoaded can hang on provider analytics/resources.
+                wait_until="commit",
+                timeout=refresh_timeout_ms,
             ),
-            timeout=max(Config.NEW_CHAT_TIMEOUT, 1) / 1000,
+            timeout=(refresh_timeout_ms + 1000) / 1000,
         )
-        log.info("Provider page refreshed after response")
+        try:
+            await client.page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=3000,
+            )
+            log.info("Provider page refreshed and ready after response")
+        except Exception:
+            # The refresh itself committed successfully. Do not prolong cleanup
+            # if a third-party resource delays DOM readiness.
+            log.info("Provider page refresh committed after response")
     except Exception as exc:
         # The API response has already been sent. Log cleanup failures and let
         # the next request's fresh-chat check recover the browser if needed.

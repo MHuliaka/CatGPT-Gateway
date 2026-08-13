@@ -269,7 +269,7 @@ Key settings:
 | `API_TOKEN` | `dummy123` | Bearer token for API authentication |
 | `API_PORT` | `8000` | Port the API server listens on |
 | `HEADLESS` | `false` | Run browser without display (not recommended) |
-| `NEW_CHAT_TIMEOUT` | `30000` | Maximum milliseconds allowed to open or refresh the isolated browser chat |
+| `NEW_CHAT_TIMEOUT` | `30000` | Overall new-chat safety limit; individual navigation and refresh attempts use shorter bounds |
 
 > See [.env.example](.env.example) for all available settings with descriptions.
 

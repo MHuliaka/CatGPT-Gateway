@@ -169,32 +169,109 @@ class ClaudeClient:
     # ── Navigation ──────────────────────────────────────────────
 
     async def new_chat(self) -> None:
-        """Start a new conversation by navigating to /new."""
-        log.info("Starting new chat...")
+        """Start a new conversation using bounded navigation attempts."""
         url = Config.CLAUDE_URL.rstrip("/") + "/new"
-        await self._page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=Config.NEW_CHAT_TIMEOUT,
-        )
-        await asyncio.sleep(1.5)
 
-        # Wait for the chat input to be visible
-        selector = ", ".join(ClaudeSelectors.CHAT_INPUT)
+        if await self._wait_for_fresh_chat(timeout_ms=1000):
+            log.info("Already on a fresh Claude chat — skipping navigation")
+            return
+
+        clicked = False
         try:
-            await self._page.wait_for_selector(
-                selector,
-                timeout=Config.SELECTOR_TIMEOUT,
-                state="visible",
+            clicked = bool(
+                await asyncio.wait_for(
+                    self._page.evaluate(
+                        """
+                        (selectors) => {
+                            for (const selector of selectors) {
+                                for (const element of document.querySelectorAll(selector)) {
+                                    const style = window.getComputedStyle(element);
+                                    const rect = element.getBoundingClientRect();
+                                    if (style.display !== 'none' &&
+                                        style.visibility !== 'hidden' &&
+                                        rect.width > 0 && rect.height > 0) {
+                                        element.click();
+                                        return true;
+                                    }
+                                }
+                            }
+                            return false;
+                        }
+                        """,
+                        ClaudeSelectors.NEW_CHAT_BUTTON,
+                    ),
+                    timeout=1.5,
+                )
             )
-            log.debug("Chat input ready")
         except Exception as exc:
-            raise RuntimeError(
-                "New chat opened without an interactive chat input"
-            ) from exc
+            log.debug(f"Fast Claude new-chat click failed: {exc}")
 
-        await random_delay(300, 600)
-        log.info("New chat started (navigated to /new)")
+        if clicked:
+            log.info("New Claude chat via fast SPA click")
+            if await self._wait_for_fresh_chat(timeout_ms=4000):
+                return
+
+        try:
+            log.info("New Claude chat via JS navigation...")
+            await asyncio.wait_for(
+                self._page.evaluate(
+                    "() => window.location.assign(new URL('/new', window.location.origin).href)"
+                ),
+                timeout=1.5,
+            )
+        except Exception as exc:
+            log.debug(f"Claude JS navigation returned an error: {exc}")
+
+        if await self._wait_for_fresh_chat(timeout_ms=5000):
+            log.info("New Claude chat started (JS navigation)")
+            return
+
+        try:
+            log.info("New Claude chat via short page.goto fallback...")
+            await self._page.goto(
+                url,
+                wait_until="commit",
+                timeout=min(max(Config.NEW_CHAT_TIMEOUT, 1000), 7000),
+            )
+        except Exception as exc:
+            log.warning(f"Short Claude page.goto fallback returned an error: {exc}")
+
+        if await self._wait_for_fresh_chat(timeout_ms=5000):
+            log.info("New Claude chat started (short page.goto)")
+            return
+
+        raise RuntimeError(
+            f"Provider did not open an isolated new chat (current URL: {self._page.url})"
+        )
+
+    async def _wait_for_fresh_chat(self, timeout_ms: int) -> bool:
+        """Wait briefly for Claude's new-chat URL and visible composer."""
+        deadline = time.monotonic() + (max(timeout_ms, 1) / 1000)
+        selector = ", ".join(ClaudeSelectors.CHAT_INPUT)
+
+        while time.monotonic() < deadline:
+            current_url = self._page.url.rstrip("/")
+            on_new_chat = current_url.endswith("/new") and not self._extract_thread_id()
+            if on_new_chat:
+                remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                try:
+                    composer = await self._page.wait_for_selector(
+                        selector,
+                        timeout=min(750, remaining_ms),
+                        state="visible",
+                    )
+                    if composer:
+                        await asyncio.sleep(0.2)
+                        return True
+                except Exception:
+                    pass
+
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds > 0:
+                await asyncio.sleep(min(0.2, remaining_seconds))
+
+        return False
+
 
     async def navigate_to_thread(self, thread_id: str) -> None:
         """Navigate to an existing conversation thread."""

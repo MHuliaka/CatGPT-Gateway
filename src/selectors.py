@@ -45,6 +45,10 @@ class Selectors:
     # ── New chat ────────────────────────────────────────────────
     NEW_CHAT_BUTTON = [
         "a[data-testid='create-new-chat-button']",
+        "button[data-testid='create-new-chat-button']",
+        "[data-testid='create-new-chat-button']",
+        "a[aria-label='New chat']",
+        "button[aria-label='New chat']",
         "a[href='/']",
         "nav a[href='/']",
     ]
