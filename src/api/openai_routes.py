@@ -18,7 +18,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
 
 from src.api.chat_lifecycle import NewChatTimeoutError, start_new_chat
@@ -119,6 +119,34 @@ def _record_response_time() -> None:
     if not Config.uses_browser():
         return
     _last_response_time = time.time()
+
+
+async def _refresh_browser_page(client: ChatGPTClient | ClaudeClient) -> None:
+    """Reload the provider page after its API response has been delivered."""
+    try:
+        await asyncio.wait_for(
+            client.page.reload(
+                wait_until="domcontentloaded",
+                timeout=Config.NEW_CHAT_TIMEOUT,
+            ),
+            timeout=max(Config.NEW_CHAT_TIMEOUT, 1) / 1000,
+        )
+        log.info("Provider page refreshed after response")
+    except Exception as exc:
+        # The API response has already been sent. Log cleanup failures and let
+        # the next request's fresh-chat check recover the browser if needed.
+        log.warning(f"Post-response page refresh failed: {exc}")
+
+
+async def _refresh_browser_page_and_release_lock(
+    client: ChatGPTClient | ClaudeClient,
+    lock: asyncio.Lock,
+) -> None:
+    """Run post-response cleanup while retaining exclusive browser access."""
+    try:
+        await _refresh_browser_page(client)
+    finally:
+        lock.release()
 
 
 def _resolve_model_id(requested: str | None) -> str:
@@ -753,6 +781,7 @@ async def create_image(
 @openai_router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion(
     request: ChatCompletionRequest,
+    background_tasks: BackgroundTasks = None,
 ) -> ChatCompletionResponse:
     """
     OpenAI-compatible chat completions endpoint.
@@ -782,7 +811,13 @@ async def create_chat_completion(
     client = _get_client()
     model_id = _resolve_model_id(request.model)
 
-    async with _get_lock():
+    # Keep the browser lock through the post-response refresh. FastAPI runs
+    # BackgroundTasks only after the response body has been sent, so retaining
+    # the lock here prevents a queued request from racing the page reload.
+    lock = _get_lock()
+    await lock.acquire()
+    release_lock_here = True
+    try:
         start_time = time.time()
 
         # ── Build the prompt ────────────────────────────────
@@ -923,7 +958,25 @@ async def create_chat_completion(
         )
 
         _record_response_time()
+
+        if Config.uses_browser():
+            if background_tasks is None:
+                # Supports direct/internal invocation outside FastAPI, where
+                # there is no response lifecycle to host a background task.
+                await _refresh_browser_page(client)
+            else:
+                background_tasks.add_task(
+                    _refresh_browser_page_and_release_lock,
+                    client,
+                    lock,
+                )
+                release_lock_here = False
+                log.debug("Scheduled provider page refresh after response delivery")
+
         return response
+    finally:
+        if release_lock_here:
+            lock.release()
 
 
 # ── Responses API (/v1/responses) ───────────────────────────────

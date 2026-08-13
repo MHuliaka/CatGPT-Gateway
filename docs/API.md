@@ -58,6 +58,10 @@ is the complete source of conversation context, so include all prior turns for
 a multi-turn conversation. Earlier API calls are never inherited implicitly,
 and you do not need to call `/thread/new` first.
 
+For browser-backed providers, once the response body has been sent, the gateway
+refreshes the provider page as background cleanup. A queued browser request
+waits for that refresh to finish before it proceeds.
+
 ```python
 from openai import OpenAI
 
