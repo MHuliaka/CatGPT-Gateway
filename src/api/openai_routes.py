@@ -885,10 +885,10 @@ async def create_chat_completion(
         response_text = result.message
         elapsed_ms = int((time.time() - start_time) * 1000)
 
-        # ── Detect echo (extraction grabbed sent prompt instead of reply) ──
+        # ── Detect Claude DOM extraction echo ──
         _echo_markers = ["[System instruction:", "tool-calling mode", "Available functions:"]
         if (
-            Config.uses_browser()
+            Config.PROVIDER == "claude"
             and response_text
             and has_tool_prompt
             and any(m in response_text for m in _echo_markers)

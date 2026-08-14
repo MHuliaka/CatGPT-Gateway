@@ -59,7 +59,8 @@ services:
       - RESPONSE_TIMEOUT=120000
       - SELECTOR_TIMEOUT=10000
       - NEW_CHAT_TIMEOUT=30000
-      # Capture response, wait this many seconds, refresh, then return it
+      # After response capture, wait this many seconds, refresh, then return it.
+      # ChatGPT text is captured from the backend SSE stream, not the page DOM.
       - POST_RESPONSE_REFRESH_DELAY_SECONDS=3
 
       # Human simulation

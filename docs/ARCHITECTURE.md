@@ -34,7 +34,8 @@ FastAPI server (port 8000)
 Provider client (ChatGPTClient or ClaudeClient)
     |
     |-- client.py            send_message(), new_chat(), file upload
-    |-- detector.py          Waits for response completion
+    |-- backend_response.py  Rebuilds ChatGPT text from backend SSE events
+    |-- detector.py          Claude and legacy DOM completion helpers
     |-- selectors.py         DOM selectors for the provider's UI
     v
 BrowserManager (Patchright / Playwright)
@@ -92,45 +93,47 @@ The gateway uses multiple techniques to avoid bot detection:
 ```
 send_message(text, image_paths, file_paths)
 |
-|-- 1. Count existing assistant messages (pre_count)
-|-- 2. Random delay (500-1200ms, human simulation)
-|-- 3. Upload files if any
+|-- 1. Random delay (human simulation)
+|-- 2. Upload files if any
 |      +-- set_input_files() on hidden <input type="file">
 |      +-- Wait 3s + extra per file for processing
-|-- 4. Find chat input via selector fallback
+|-- 3. Find chat input via selector fallback
+|-- 4. Arm request + response listeners for POST /f/conversation
 |-- 5. Paste text via keyboard.insert_text()
-|-- 6. Random delay (300-600ms)
-|-- 7. Click send button (or fallback to Enter key)
-|-- 8. Wait for response completion (detector)
-|-- 9. Sleep 1s for DOM to settle
-|-- 10. Check for DALL-E images (ChatGPT only)
-|-- 11. Extract response text
-|       |-- Image response: DOM scraping
-|       +-- Text response: copy button click
-+-- 12. Return ChatResponse(message, thread_id, elapsed_ms, images)
+|-- 6. If no conversation POST appeared, click Send (or press Enter)
+|-- 7. Read the completed backend response body
+|-- 8. Parse classic snapshots or v1 JSON-patch SSE events
+|-- 9. Check the rendered turn only for generated-image asset URLs
++-- 10. Return ChatResponse(message, backend conversation_id, elapsed_ms, images)
 ```
 
 ---
 
 ## Response Detection
 
-The detector (`detector.py`) uses multiple strategies to know when the model finishes responding:
+### ChatGPT: Backend Event Stream
 
-### Primary: Copy Button
+Before entering text, `ChatGPTClient` arms listeners for the conversation POST
+and its response. This is important because some frontend builds submit during
+`insert_text()`. The appearance of that POST also decides whether the Send
+button still needs to be clicked.
 
-The copy button only appears after the full response is generated. The detector waits for a copy button on the Nth assistant message (where N = expected count).
+Patchright waits for the response body to finish within `RESPONSE_TIMEOUT`.
+`backend_response.py` then parses its SSE `data:` frames. It supports both older
+full-message snapshots and the compact `supported_encodings: ["v1"]` format,
+which uses `append`, `replace`, and batched `patch` operations against paths such
+as `/message/content/parts/0`. Hidden reasoning and tool-recipient messages are
+excluded; the final visible assistant message is returned.
 
-### Fallback: Stop Button Lifecycle
+The DOM is not used for ChatGPT text or completion detection. It is still
+inspected after completion for generated-image URLs because those assets must be
+downloaded with the authenticated browser session.
 
-While streaming, a "Stop generating" button is visible. The detector watches for it to appear then disappear.
+### Claude: DOM Completion
 
-### Fallback: Text Stability
-
-If neither button is found, the detector polls the last assistant message text. If it stays the same for 4+ consecutive checks (2s apart), the response is considered complete.
-
-### Message Counting
-
-Counts both `div[data-message-author-role='assistant']` (ChatGPT) and provider-specific elements. Image responses use different selectors than text responses.
+Claude continues to use `src/claude/detector.py`: streaming indicator, copy
+button, and text-stability fallbacks. Its final response text is copied from the
+UI.
 
 ---
 
@@ -199,7 +202,8 @@ API Request (with image_url / file content parts)
 
 ## Echo Detection and Recovery
 
-Sometimes the copy-button extraction grabs the sent prompt instead of the response (race condition). The gateway detects and recovers:
+Claude's copy-button extraction can occasionally grab the sent prompt instead
+of the response. The gateway detects and recovers:
 
 1. Check if `response_text` contains known markers from the injected tool prompt (`"Available functions:"`, `"tool-calling mode"`, etc.)
 2. If echo detected, wait 3 seconds and retry `extract_last_response_via_copy()`
@@ -234,7 +238,8 @@ The gateway supports multiple providers through parallel client implementations:
 ```
 src/chatgpt/
 |-- client.py       ChatGPTClient(send_message, new_chat, ...)
-|-- detector.py     ChatGPT-specific response detection
+|-- backend_response.py  Conversation SSE and v1 patch parser
+|-- detector.py     Legacy DOM helpers retained for diagnostics/tests
 |-- selectors.py    (uses src/selectors.py)
 |-- image_handler.py  DALL-E image detection
 +-- models.py

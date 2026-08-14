@@ -58,9 +58,11 @@ is the complete source of conversation context, so include all prior turns for
 a multi-turn conversation. Earlier API calls are never inherited implicitly,
 and you do not need to call `/thread/new` first.
 
-For browser-backed providers, the gateway captures the response, waits 3
-seconds, refreshes the provider page, and then sends the saved response body.
-Browser access stays locked until this sequence finishes.
+For ChatGPT, the gateway submits through the authenticated browser and captures
+assistant text from the matching conversation backend SSE response instead of
+the rendered page. It then waits 3 seconds, refreshes the provider page, and
+sends the saved result. Claude continues to use UI extraction. Browser access
+stays locked until this sequence finishes.
 
 Fresh-chat navigation uses several short attempts rather than one 30-second UI
 action, so a stale or changed new-chat control cannot consume the entire reset

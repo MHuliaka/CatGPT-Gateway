@@ -154,10 +154,12 @@ call leaking into a later one. The custom `/chat` and `/thread/{id}/chat`
 endpoints remain stateful for callers that explicitly want to continue a
 browser thread.
 
-For browser-backed providers, `/v1/chat/completions` first captures the model
-response, waits 3 seconds, refreshes the provider page, and only then returns
-the saved response to the caller. Browser access remains locked throughout
-that sequence.
+For ChatGPT, `/v1/chat/completions` submits through the authenticated browser
+but reads assistant text directly from the matching conversation backend SSE
+response; it does not copy text from the rendered page. The gateway then waits
+3 seconds, refreshes the provider page, and returns the saved result. Claude
+continues to use UI extraction. Browser access remains locked throughout that
+sequence.
 
 ### Python (OpenAI SDK)
 
