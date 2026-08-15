@@ -34,8 +34,8 @@ FastAPI server (port 8000)
 Provider client (ChatGPTClient or ClaudeClient)
     |
     |-- client.py            send_message(), new_chat(), file upload
-    |-- backend_response.py  Rebuilds ChatGPT text from backend SSE events
-    |-- detector.py          Claude and legacy DOM completion helpers
+    |-- backend_response.py  Retained parser for recorded backend SSE payloads
+    |-- detector.py          ChatGPT DOM completion + Copy-button extraction
     |-- selectors.py         DOM selectors for the provider's UI
     v
 BrowserManager (Patchright / Playwright)
@@ -98,36 +98,35 @@ send_message(text, image_paths, file_paths)
 |      +-- set_input_files() on hidden <input type="file">
 |      +-- Wait 3s + extra per file for processing
 |-- 3. Find chat input via selector fallback
-|-- 4. Arm request + response listeners for POST /f/conversation
+|-- 4. Arm a request listener for POST /f/conversation
 |-- 5. Paste text via keyboard.insert_text()
 |-- 6. If no conversation POST appeared, click Send (or press Enter)
-|-- 7. Read the completed backend response body
-|-- 8. Parse classic snapshots or v1 JSON-patch SSE events
-|-- 9. Check the rendered turn only for generated-image asset URLs
-+-- 10. Return ChatResponse(message, backend conversation_id, elapsed_ms, images)
+|-- 7. Wait for a Copy button or image on the newest assistant turn
+|-- 8. Press Page Down, click Copy, wait 0.8s, then read the clipboard
+|-- 9. For image turns, read descriptive text and asset URLs from the DOM
++-- 10. Return ChatResponse(message, URL thread_id, elapsed_ms, images)
 ```
 
 ---
 
 ## Response Detection
 
-### ChatGPT: Backend Event Stream
+### ChatGPT: DOM Completion and Copy Button
 
-Before entering text, `ChatGPTClient` arms listeners for the conversation POST
-and its response. This is important because some frontend builds submit during
-`insert_text()`. The appearance of that POST also decides whether the Send
-button still needs to be clicked.
+Before entering text, `ChatGPTClient` records the newest assistant-turn
+signature and arms a listener for the outgoing conversation POST. This prevents
+duplicate submission when a frontend build submits during `insert_text()`; no
+response content is read from that network request.
 
-Patchright waits for the response body to finish within `RESPONSE_TIMEOUT`.
-`backend_response.py` then parses its SSE `data:` frames. It supports both older
-full-message snapshots and the compact `supported_encodings: ["v1"]` format,
-which uses `append`, `replace`, and batched `patch` operations against paths such
-as `/message/content/parts/0`. Hidden reasoning and tool-recipient messages are
-excluded; the final visible assistant message is returned.
+`detector.py` watches the newest assistant turn until its Copy button appears,
+with stop-button and text-stability fallbacks bounded by `RESPONSE_TIMEOUT`.
+Extraction then clears focus, presses Page Down, clicks Copy on that same turn,
+waits 0.8 seconds, and reads the clipboard. If clipboard extraction fails, the
+same latest turn's DOM text is used as a fallback.
 
-The DOM is not used for ChatGPT text or completion detection. It is still
-inspected after completion for generated-image URLs because those assets must be
-downloaded with the authenticated browser session.
+Generated-image turns are inspected directly because they may not expose a Copy
+button and their assets must be downloaded with the authenticated browser
+session.
 
 ### Claude: DOM Completion
 

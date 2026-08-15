@@ -555,6 +555,29 @@ async def _wait_via_text_stability(
     return False
 
 
+async def _page_down_before_copy(page: Page) -> None:
+    """Press Page Down immediately before clicking the response Copy button."""
+    try:
+        await page.evaluate(
+            """
+            () => {
+                const active = document.activeElement;
+                if (active && typeof active.blur === 'function') {
+                    active.blur();
+                }
+            }
+            """
+        )
+    except Exception as exc:
+        log.debug(f"Could not clear focus before Page Down: {exc}")
+
+    try:
+        await page.keyboard.press("PageDown")
+        log.info("Pressed Page Down before clicking the response Copy button")
+    except Exception as exc:
+        log.warning(f"Could not press Page Down before response copy: {exc}")
+
+
 async def extract_last_response_via_copy(
     page: Page,
     previous_turn_signature: str | None = None,
@@ -574,6 +597,8 @@ async def extract_last_response_via_copy(
 
         pre_clipboard = await page.evaluate("navigator.clipboard.readText().catch(() => '')")
         await page.evaluate("navigator.clipboard.writeText('').catch(() => {})")
+
+        await _page_down_before_copy(page)
 
         click_result = await page.evaluate(
             """
@@ -616,7 +641,8 @@ async def extract_last_response_via_copy(
         )
 
         if isinstance(click_result, dict) and click_result.get("clicked"):
-            await asyncio.sleep(0.3)
+            # Previously 0.3s; wait an additional 0.5s for clipboard delivery.
+            await asyncio.sleep(0.8)
             content = await page.evaluate("navigator.clipboard.readText().catch(() => '')")
             if content and content.strip() and content.strip() != str(pre_clipboard).strip():
                 log.info(

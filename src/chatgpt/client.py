@@ -17,10 +17,13 @@ from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 from src.config import Config
 from src.selectors import Selectors
 from src.browser.human import human_type, human_click, thinking_pause, random_delay
-from src.chatgpt.backend_response import (
-    BackendResponseError,
-    is_conversation_request,
-    read_conversation_response,
+from src.chatgpt.backend_response import is_conversation_request
+from src.chatgpt.detector import (
+    wait_for_response_complete,
+    extract_last_response_via_copy,
+    count_assistant_messages,
+    get_latest_assistant_turn_signature,
+    is_incomplete_response_text,
 )
 from src.chatgpt.image_handler import extract_images_from_response
 from src.chatgpt.models import ChatResponse
@@ -121,9 +124,9 @@ class ChatGPTClient:
         3. Find and focus chat input
         4. Type message with human-like delays
         5. Click send
-        6. Press Page Down to keep the incoming response in view
-        7. Wait for the conversation backend response to complete
-        8. Parse its SSE events and return the assistant message
+        6. Wait for the latest assistant turn to finish in the page
+        7. Press Page Down and click that turn's Copy button
+        8. Read the copied response text from the clipboard
 
         Returns ChatResponse with the assistant's reply and metadata.
         """
@@ -136,6 +139,13 @@ class ChatGPTClient:
         if page_error:
             log.warning(f"Page error detected before send: {page_error}")
             raise RuntimeError(f"Page is in error state: {page_error}")
+
+        # Track the latest assistant turn so extraction cannot return a reply
+        # from the previous request.
+        pre_count = await count_assistant_messages(self._page)
+        pre_turn_signature = await get_latest_assistant_turn_signature(self._page)
+        log.debug(f"Assistant messages before send: {pre_count}")
+        log.debug(f"Latest assistant turn before send: {pre_turn_signature}")
 
         # 0.5 Check for and dismiss any blocking dialogs/overlays
         await self._dismiss_overlays()
@@ -158,94 +168,119 @@ class ChatGPTClient:
         if not input_selector:
             raise RuntimeError("Could not find chat input element")
 
-        # Arm both listeners before text entry. The current frontend can submit
-        # during insert_text(), so attaching after typing creates a race.
+        # Arm the submission listener before text entry. The current frontend
+        # can submit during insert_text(), so attaching later creates a race.
         loop = asyncio.get_running_loop()
-        response_deadline = loop.time() + (Config.RESPONSE_TIMEOUT / 1000)
+        submission_deadline = loop.time() + (Config.RESPONSE_TIMEOUT / 1000)
 
         try:
-            async with self._page.expect_response(
-                lambda response: is_conversation_request(response.request),
+            async with self._page.expect_request(
+                is_conversation_request,
                 timeout=Config.RESPONSE_TIMEOUT,
-            ) as response_info:
-                async with self._page.expect_request(
-                    is_conversation_request,
-                    timeout=Config.RESPONSE_TIMEOUT,
-                ) as request_info:
-                    request_waiter = asyncio.ensure_future(request_info.value)
+            ) as request_info:
+                request_waiter = asyncio.ensure_future(request_info.value)
 
-                    # 3. Paste the message (all at once).
-                    await human_type(self._page, input_selector, text)
+                # 3. Paste the message (all at once).
+                await human_type(self._page, input_selector, text)
 
-                    # 4. Detect auto-submit from the real conversation POST. A
-                    # DOM turn can appear later and previously caused duplicate
-                    # sends when the request had already started.
-                    remaining = max(response_deadline - loop.time(), 0.001)
-                    request_done, _ = await asyncio.wait(
-                        {request_waiter}, timeout=min(3.0, remaining)
+                # 4. Detect auto-submit from the real conversation POST. This
+                # listener only detects submission; response text is copied
+                # from the completed assistant turn in the page below.
+                remaining = max(submission_deadline - loop.time(), 0.001)
+                request_done, _ = await asyncio.wait(
+                    {request_waiter}, timeout=min(3.0, remaining)
+                )
+                auto_submitted = bool(request_done)
+
+                if auto_submitted:
+                    request_waiter.result()
+                    log.info(
+                        "ChatGPT auto-submitted after text entry — "
+                        "skipping send button click"
                     )
-                    auto_submitted = bool(request_done)
+                else:
+                    log.info("No auto-submit detected, clicking send button")
+                    sent = await self._click_send()
+                    if not sent:
+                        log.info("Send button not found, trying Enter key")
+                        await self._page.keyboard.press("Enter")
 
-                    if auto_submitted:
-                        request_waiter.result()
-                        log.info(
-                            "ChatGPT auto-submitted after text entry — "
-                            "skipping send button click"
-                        )
-                    else:
-                        log.info("No auto-submit detected, clicking send button")
-                        sent = await self._click_send()
-                        if not sent:
-                            log.info("Send button not found, trying Enter key")
-                            await self._page.keyboard.press("Enter")
-
-                    remaining = max(response_deadline - loop.time(), 0.001)
-                    await asyncio.wait_for(
-                        asyncio.shield(request_waiter), timeout=remaining
-                    )
-
-                    # Mirror a human Page Down after the prompt has been
-                    # submitted, before reading and returning the response.
-                    await self._page_down_before_response()
-
-            log.info("Waiting for ChatGPT backend event stream...")
-            remaining = max(response_deadline - loop.time(), 0.001)
-            backend_http_response = await asyncio.wait_for(
-                response_info.value, timeout=remaining
-            )
-            remaining = max(response_deadline - loop.time(), 0.001)
-            backend_result = await asyncio.wait_for(
-                read_conversation_response(backend_http_response),
-                timeout=remaining,
-            )
+                remaining = max(submission_deadline - loop.time(), 0.001)
+                await asyncio.wait_for(
+                    asyncio.shield(request_waiter), timeout=remaining
+                )
         except (asyncio.TimeoutError, PlaywrightTimeoutError) as exc:
             raise TimeoutError(
-                "ChatGPT backend response did not complete within the configured timeout"
+                "ChatGPT conversation request was not submitted within the configured timeout"
             ) from exc
 
-        response_text = backend_result.text
+        # Wait for the latest assistant turn to expose its completion controls.
+        log.info("Waiting for ChatGPT response in the page...")
+        completed = await wait_for_response_complete(
+            self._page,
+            expected_msg_count=pre_count + 1,
+            previous_turn_signature=pre_turn_signature,
+        )
+        if not completed:
+            log.warning("Response may not be complete (timeout)")
 
-        # Give the frontend a brief chance to materialize generated-image
-        # elements. Text always comes from backend_result, never from the DOM.
+        # Give the completed turn a brief chance to settle before extraction.
         await asyncio.sleep(0.2)
 
-        # Preserve authenticated generated-image downloads. This only reads
-        # image asset URLs; assistant text remains backend-derived.
+        # Image turns may not expose a Copy button, so detect them first.
         images = await extract_images_from_response(self._page)
         has_images = len(images) > 0
 
         if has_images:
+            response_text = await self._extract_image_turn_text(pre_turn_signature)
             log.info(f"Response contains {len(images)} generated image(s)")
             for img in images:
                 log.info(f"  Image: {img.alt or img.prompt_title} → {img.local_path}")
-
-        if not response_text.strip() and not has_images:
-            raise BackendResponseError(
-                "ChatGPT backend stream completed without assistant text or images"
+        else:
+            response_text = await extract_last_response_via_copy(
+                self._page,
+                previous_turn_signature=pre_turn_signature,
             )
 
+            if not response_text.strip():
+                log.warning("Empty response extracted — retrying after short wait")
+                for retry in range(1, 4):
+                    await asyncio.sleep(1.5 * retry)
+                    response_text = await extract_last_response_via_copy(
+                        self._page,
+                        previous_turn_signature=pre_turn_signature,
+                    )
+                    if response_text.strip():
+                        log.info(f"Got response on extraction retry {retry}")
+                        break
+
+            if is_incomplete_response_text(response_text):
+                log.warning(
+                    "Extracted text looks incomplete/transient; retrying for final answer"
+                )
+                for attempt in range(1, 3):
+                    await asyncio.sleep(2)
+                    retry_text = await extract_last_response_via_copy(
+                        self._page,
+                        previous_turn_signature=pre_turn_signature,
+                    )
+
+                    if retry_text and not is_incomplete_response_text(retry_text):
+                        response_text = retry_text
+                        log.info(f"Recovered final response text on retry {attempt}")
+                        break
+
+                    if retry_text:
+                        response_text = retry_text
+                    log.warning(f"Retry {attempt} still incomplete/transient")
+
+                if is_incomplete_response_text(response_text):
+                    raise TimeoutError(
+                        "ChatGPT response did not complete within the configured timeout"
+                    )
+
         elapsed_ms = int((time.time() - start_time) * 1000)
-        thread_id = backend_result.conversation_id or self._extract_thread_id()
+        thread_id = self._extract_thread_id()
 
         log.info(
             f"Response received ({elapsed_ms}ms, {len(response_text)} chars"
@@ -513,27 +548,60 @@ class ChatGPTClient:
 
     # ── Private Helpers ─────────────────────────────────────────
 
-    async def _page_down_before_response(self) -> None:
-        """Press Page Down without risking an otherwise valid response."""
-        try:
-            await self._page.evaluate(
-                """
-                () => {
-                    const active = document.activeElement;
-                    if (active && typeof active.blur === 'function') {
-                        active.blur();
-                    }
-                }
-                """
-            )
-        except Exception as exc:
-            log.debug(f"Could not clear focus before Page Down: {exc}")
+    async def _extract_image_turn_text(
+        self,
+        previous_turn_signature: str | None = None,
+    ) -> str:
+        """Extract descriptive text from the latest generated-image turn."""
+        text = await self._page.evaluate(
+            """
+            (previousSignature) => {
+                const turns = document.querySelectorAll(
+                    'section[data-testid^="conversation-turn-"]'
+                );
 
-        try:
-            await self._page.keyboard.press("PageDown")
-            log.info("Pressed Page Down before fetching the ChatGPT response")
-        except Exception as exc:
-            log.warning(f"Could not press Page Down before response capture: {exc}")
+                for (let idx = turns.length - 1; idx >= 0; idx--) {
+                    const turn = turns[idx];
+                    const turnRole = turn.getAttribute('data-turn');
+                    const hasAssistantRole = turnRole === 'assistant' ||
+                        Boolean(turn.querySelector(
+                            '[data-message-author-role="assistant"]'
+                        ));
+                    if (!hasAssistantRole) continue;
+
+                    const stableId =
+                        turn.getAttribute('data-turn-id') ||
+                        turn.getAttribute('data-testid') ||
+                        turn.id ||
+                        '';
+                    const signature = `${idx}:${stableId}`;
+                    if (previousSignature && signature === previousSignature) {
+                        return '';
+                    }
+
+                    const spans = turn.querySelectorAll('span');
+                    const parts = [];
+                    for (const span of spans) {
+                        const value = (span.innerText || '').trim();
+                        if (value && value.length > 3 && value.length < 300 &&
+                            !value.includes('ChatGPT') && !value.includes('said')) {
+                            parts.push(value);
+                        }
+                    }
+                    if (parts.length > 0) return parts.join(' ');
+
+                    return (turn.innerText || '')
+                        .trim()
+                        .replace(/^ChatGPT said:\\s*/i, '')
+                        .trim();
+                }
+
+                return '';
+            }
+            """,
+            previous_turn_signature,
+        )
+        return text or ""
 
     async def _find_selector(self, selectors: list[str], name: str) -> str | None:
         """
