@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
+from src.api.chat_lifecycle import return_home_after_call
 from src.api.openai_schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -89,6 +90,9 @@ async def _ensure_fresh_chat() -> None:
     """
     global _thread_message_count, _last_response_time
 
+    if not Config.uses_browser():
+        return
+
     # Enforce minimum gap between messages
     if _last_response_time > 0:
         elapsed = time.time() - _last_response_time
@@ -119,9 +123,17 @@ async def _ensure_fresh_chat() -> None:
 def _increment_thread_count() -> None:
     """Increment the thread message counter after a successful response."""
     global _thread_message_count, _last_response_time
+    if not Config.uses_browser():
+        return
     _thread_message_count += 1
     _last_response_time = time.time()
     log.debug(f"Thread message count: {_thread_message_count}/{_MAX_THREAD_MESSAGES}")
+
+
+def _reset_thread_count() -> None:
+    """Record that post-call navigation left the browser on a fresh chat."""
+    global _thread_message_count
+    _thread_message_count = 0
 
 
 def _resolve_model_id(requested: str | None) -> str:
@@ -645,7 +657,7 @@ async def create_image(
 
     client = _get_client()
 
-    async with _get_lock():
+    async with _get_lock(), return_home_after_call(client, _reset_thread_count):
         start_time = time.time()
 
         # Build an image-generation prompt.
@@ -766,7 +778,7 @@ async def create_chat_completion(
     client = _get_client()
     model_id = _resolve_model_id(request.model)
 
-    async with _get_lock():
+    async with _get_lock(), return_home_after_call(client, _reset_thread_count):
         start_time = time.time()
 
         # ── Build the prompt ────────────────────────────────
@@ -1250,7 +1262,7 @@ async def create_response(request: ResponsesRequest):
     client = _get_client()
     model_id = _resolve_model_id(request.model)
 
-    async with _get_lock():
+    async with _get_lock(), return_home_after_call(client, _reset_thread_count):
         start_time = time.time()
 
         # ── Convert input to ChatMessage list ───────────────

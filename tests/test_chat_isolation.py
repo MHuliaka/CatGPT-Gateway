@@ -5,8 +5,6 @@ import time
 import unittest
 from unittest.mock import patch
 
-from fastapi import HTTPException
-
 from src.api import openai_routes
 from src.api.chat_lifecycle import NewChatTimeoutError, start_new_chat
 from src.api.openai_schemas import ChatCompletionRequest, ChatMessage
@@ -38,7 +36,7 @@ class RecordingBrowserClient:
         )
 
 
-class FailingBrowserClient(RecordingBrowserClient):
+class HomeResetFailingBrowserClient(RecordingBrowserClient):
     async def new_chat(self) -> None:
         self.events.append("new_chat")
         raise RuntimeError("navigation failed")
@@ -54,15 +52,18 @@ class ChatIsolationTests(unittest.TestCase):
         self.previous_client = openai_routes._client
         self.previous_lock = openai_routes._lock
         self.previous_response_time = openai_routes._last_response_time
+        self.previous_thread_count = openai_routes._thread_message_count
         openai_routes._lock = None
         openai_routes._last_response_time = 0.0
+        openai_routes._thread_message_count = 0
 
     def tearDown(self) -> None:
         openai_routes._client = self.previous_client
         openai_routes._lock = self.previous_lock
         openai_routes._last_response_time = self.previous_response_time
+        openai_routes._thread_message_count = self.previous_thread_count
 
-    def test_each_chat_completion_opens_a_new_browser_chat(self) -> None:
+    def test_each_chat_completion_returns_browser_home_after_response(self) -> None:
         client = RecordingBrowserClient()
         openai_routes._client = client
         request = ChatCompletionRequest(
@@ -74,29 +75,33 @@ class ChatIsolationTests(unittest.TestCase):
             await openai_routes.create_chat_completion(request)
 
         with patch.object(Config, "PROVIDER", "chatgpt"):
-            with patch.object(Config, "NEW_CHAT_TIMEOUT", 1000):
-                with patch.object(openai_routes, "_MIN_MESSAGE_GAP", 0):
-                    asyncio.run(run_requests())
+            with patch.object(Config, "POST_RESPONSE_HOME_DELAY_SECONDS", 0):
+                with patch.object(Config, "NEW_CHAT_TIMEOUT", 1000):
+                    with patch.object(openai_routes, "_MIN_MESSAGE_GAP", 0):
+                        asyncio.run(run_requests())
 
         self.assertEqual(
             client.events,
-            ["new_chat", "send_message", "new_chat", "send_message"],
+            ["send_message", "new_chat", "send_message", "new_chat"],
         )
+        self.assertEqual(openai_routes._thread_message_count, 0)
 
-    def test_completion_fails_closed_if_chat_cannot_be_isolated(self) -> None:
-        client = FailingBrowserClient()
+    def test_home_navigation_failure_does_not_replace_captured_response(self) -> None:
+        client = HomeResetFailingBrowserClient()
         openai_routes._client = client
         request = ChatCompletionRequest(
             messages=[ChatMessage(role="user", content="Hello")]
         )
 
         with patch.object(Config, "PROVIDER", "chatgpt"):
-            with patch.object(openai_routes, "_MIN_MESSAGE_GAP", 0):
-                with self.assertRaises(HTTPException) as raised:
-                    asyncio.run(openai_routes.create_chat_completion(request))
+            with patch.object(Config, "POST_RESPONSE_HOME_DELAY_SECONDS", 0):
+                with patch.object(openai_routes, "_MIN_MESSAGE_GAP", 0):
+                    response = asyncio.run(
+                        openai_routes.create_chat_completion(request)
+                    )
 
-        self.assertEqual(raised.exception.status_code, 502)
-        self.assertEqual(client.events, ["new_chat"])
+        self.assertEqual(response.choices[0].message.content, "response 1")
+        self.assertEqual(client.events, ["send_message", "new_chat"])
 
     def test_new_chat_navigation_has_one_total_timeout(self) -> None:
         started = time.monotonic()

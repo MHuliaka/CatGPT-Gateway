@@ -121,8 +121,9 @@ class ChatGPTClient:
         3. Find and focus chat input
         4. Type message with human-like delays
         5. Click send
-        6. Wait for the conversation backend response to complete
-        7. Parse its SSE events and return the assistant message
+        6. Press Page Down to keep the incoming response in view
+        7. Wait for the conversation backend response to complete
+        8. Parse its SSE events and return the assistant message
 
         Returns ChatResponse with the assistant's reply and metadata.
         """
@@ -202,6 +203,10 @@ class ChatGPTClient:
                     await asyncio.wait_for(
                         asyncio.shield(request_waiter), timeout=remaining
                     )
+
+                    # Mirror a human Page Down after the prompt has been
+                    # submitted, before reading and returning the response.
+                    await self._page_down_before_response()
 
             log.info("Waiting for ChatGPT backend event stream...")
             remaining = max(response_deadline - loop.time(), 0.001)
@@ -507,6 +512,28 @@ class ChatGPTClient:
         return threads
 
     # ── Private Helpers ─────────────────────────────────────────
+
+    async def _page_down_before_response(self) -> None:
+        """Press Page Down without risking an otherwise valid response."""
+        try:
+            await self._page.evaluate(
+                """
+                () => {
+                    const active = document.activeElement;
+                    if (active && typeof active.blur === 'function') {
+                        active.blur();
+                    }
+                }
+                """
+            )
+        except Exception as exc:
+            log.debug(f"Could not clear focus before Page Down: {exc}")
+
+        try:
+            await self._page.keyboard.press("PageDown")
+            log.info("Pressed Page Down before fetching the ChatGPT response")
+        except Exception as exc:
+            log.warning(f"Could not press Page Down before response capture: {exc}")
 
     async def _find_selector(self, selectors: list[str], name: str) -> str | None:
         """

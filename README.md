@@ -271,8 +271,8 @@ Key settings:
 | `API_TOKEN` | `dummy123` | Bearer token for API authentication |
 | `API_PORT` | `8000` | Port the API server listens on |
 | `HEADLESS` | `false` | Run browser without display (not recommended) |
-| `NEW_CHAT_TIMEOUT` | `30000` | Overall new-chat safety limit; individual navigation and refresh attempts use shorter bounds |
-| `POST_RESPONSE_REFRESH_DELAY_SECONDS` | `3` | Delay after capturing a response and before refreshing; the API responds after refresh |
+| `NEW_CHAT_TIMEOUT` | `30000` | Overall new-chat safety limit; individual navigation attempts use shorter bounds |
+| `POST_RESPONSE_HOME_DELAY_SECONDS` | `3` | Delay after capturing a response and before returning the browser to a fresh home page |
 
 > See [.env.example](.env.example) for all available settings with descriptions.
 

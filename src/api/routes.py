@@ -15,7 +15,11 @@ import asyncio
 
 from fastapi import APIRouter, HTTPException
 
-from src.api.chat_lifecycle import NewChatTimeoutError, start_new_chat
+from src.api.chat_lifecycle import (
+    NewChatTimeoutError,
+    return_home_after_call,
+    start_new_chat,
+)
 from src.api.schemas import (
     ChatRequest,
     ChatResponse,
@@ -87,7 +91,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
     client = _get_client()
     log.info(f"POST /chat — {len(req.message)} chars")
 
-    async with _lock:
+    async with _lock, return_home_after_call(client):
         try:
             result = await client.send_message(req.message)
             return _build_response(result)
@@ -102,7 +106,7 @@ async def chat_in_thread(thread_id: str, req: ChatRequest) -> ChatResponse:
     client = _get_client()
     log.info(f"POST /thread/{thread_id}/chat — {len(req.message)} chars")
 
-    async with _lock:
+    async with _lock, return_home_after_call(client):
         try:
             # Navigate to the thread if not already there
             current_tid = client._extract_thread_id()
@@ -122,7 +126,7 @@ async def new_thread(req: ChatRequest) -> ChatResponse:
     client = _get_client()
     log.info(f"POST /thread/new — {len(req.message)} chars")
 
-    async with _lock:
+    async with _lock, return_home_after_call(client):
         try:
             await start_new_chat(client)
             result = await client.send_message(req.message)
