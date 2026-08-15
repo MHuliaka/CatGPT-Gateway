@@ -59,10 +59,10 @@ a multi-turn conversation. Earlier API calls are never inherited implicitly,
 and you do not need to call `/thread/new` first.
 
 For ChatGPT, the gateway waits for the newest assistant turn in the rendered
-page, presses Page Down, clicks that turn's Copy button, and waits 0.8 seconds
-before reading the clipboard. It then waits 3 seconds, returns to a fresh
-provider home page, and sends the saved result. Browser access stays locked
-until this sequence finishes.
+page, presses Page Down, and clicks the last visible Copy button in document
+order. It waits 0.8 seconds before reading the clipboard, then waits 3 seconds,
+returns to a fresh provider home page, and sends the saved result. Browser
+access stays locked until this sequence finishes.
 
 Fresh-chat navigation uses several short attempts rather than one 30-second UI
 action, so a stale or changed new-chat control cannot consume the entire reset

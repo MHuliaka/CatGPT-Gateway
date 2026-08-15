@@ -102,7 +102,7 @@ send_message(text, image_paths, file_paths)
 |-- 5. Paste text via keyboard.insert_text()
 |-- 6. If no conversation POST appeared, click Send (or press Enter)
 |-- 7. Wait for a Copy button or image on the newest assistant turn
-|-- 8. Press Page Down, click Copy, wait 0.8s, then read the clipboard
+|-- 8. Press Page Down, click the last visible Copy, wait 0.8s, read clipboard
 |-- 9. For image turns, read descriptive text and asset URLs from the DOM
 +-- 10. Return ChatResponse(message, URL thread_id, elapsed_ms, images)
 ```
@@ -120,8 +120,9 @@ response content is read from that network request.
 
 `detector.py` watches the newest assistant turn until its Copy button appears,
 with stop-button and text-stability fallbacks bounded by `RESPONSE_TIMEOUT`.
-Extraction then clears focus, presses Page Down, clicks Copy on that same turn,
-waits 0.8 seconds, and reads the clipboard. If clipboard extraction fails, the
+Extraction then clears focus, presses Page Down, and clicks the last visible
+Copy button in document order (while ensuring it belongs to the latest turn).
+After 0.8 seconds it reads the clipboard. If clipboard extraction fails, the
 same latest turn's DOM text is used as a fallback.
 
 Generated-image turns are inspected directly because they may not expose a Copy

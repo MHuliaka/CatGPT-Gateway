@@ -31,7 +31,7 @@ class ChatGPTPageDownTests(unittest.TestCase):
 
         page.keyboard.press.assert_awaited_once_with("PageDown")
 
-    def test_copy_sequence_waits_point_eight_seconds(self) -> None:
+    def test_copy_sequence_uses_last_button_and_waits_point_eight_seconds(self) -> None:
         page = self._page()
         events: list[str] = []
         clipboard_values = iter(["old response", "new response"])
@@ -47,8 +47,18 @@ class ChatGPTPageDownTests(unittest.TestCase):
                 events.append("clear-clipboard")
                 return None
             if "btn.click()" in script:
+                self.assertIn(
+                    "copyButtons[copyButtons.length - 1]",
+                    script,
+                )
                 events.append("click-copy")
-                return {"clicked": True, "reason": "ok", "signature": "1:new"}
+                return {
+                    "clicked": True,
+                    "reason": "ok",
+                    "signature": "1:new",
+                    "copyCount": 4,
+                    "label": "Copy",
+                }
             raise AssertionError(f"Unexpected evaluate script: {script[:80]}")
 
         async def press(key: str) -> None:

@@ -85,7 +85,7 @@ async def _dump_all_turns(page: Page) -> list[dict]:
                     const text = (turn.innerText || '').trim().substring(0, 100);
                     const buttons = turn.querySelectorAll('button').length;
                     const copyBtn = Boolean(turn.querySelector(
-                        'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]'
+                        'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"]'
                     ));
                     const hasArticle = Boolean(turn.querySelector('article'));
                     const childTags = Array.from(turn.children).map(c => c.tagName).join(',');
@@ -126,7 +126,7 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
                     '';
 
                 const hasCopyButton = Boolean(
-                    turn.querySelector('button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]')
+                    turn.querySelector('button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"]')
                 );
 
                 const hasImage = Boolean(
@@ -217,7 +217,7 @@ async def _count_copy_buttons(page: Page) -> int:
                     Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
                 if (!hasAssistantRole) continue;
                 const hasCopyButton = turn.querySelector(
-                    'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]'
+                    'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"]'
                 );
                 if (hasCopyButton) total++;
             }
@@ -583,11 +583,11 @@ async def extract_last_response_via_copy(
     previous_turn_signature: str | None = None,
 ) -> str:
     """
-    Extract latest assistant response by clicking copy on the latest turn.
+    Extract the latest assistant response via the last visible page Copy button.
 
-    Never intentionally copies from previous_turn_signature when provided.
+    A new assistant turn must differ from previous_turn_signature when provided.
     """
-    log.debug("Attempting extraction via latest-turn copy button...")
+    log.debug("Attempting extraction via the last visible page Copy button...")
 
     try:
         await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
@@ -623,15 +623,41 @@ async def extract_last_response_via_copy(
                         return { clicked: false, reason: 'stale-turn', signature };
                     }
 
-                    const btn = turn.querySelector(
-                        'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]'
-                    );
-                    if (!btn) {
-                        return { clicked: false, reason: 'no-copy-button', signature };
+                    const copyButtons = Array.from(document.querySelectorAll(
+                        'button[data-testid="copy-turn-action-button"], ' +
+                        'button[aria-label^="Copy"], button[title^="Copy"]'
+                    )).filter((button) => {
+                        const style = window.getComputedStyle(button);
+                        const rect = button.getBoundingClientRect();
+                        return !button.disabled &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            rect.width > 0 && rect.height > 0;
+                    });
+
+                    if (copyButtons.length === 0) {
+                        return { clicked: false, reason: 'no-visible-copy-button', signature };
                     }
 
+                    const btn = copyButtons[copyButtons.length - 1];
+                    if (!turn.contains(btn)) {
+                        return {
+                            clicked: false,
+                            reason: 'last-copy-outside-latest-turn',
+                            signature,
+                        };
+                    }
+                    btn.scrollIntoView({ block: 'center', inline: 'nearest' });
                     btn.click();
-                    return { clicked: true, reason: 'ok', signature };
+                    return {
+                        clicked: true,
+                        reason: 'ok',
+                        signature,
+                        copyCount: copyButtons.length,
+                        label: btn.getAttribute('aria-label') ||
+                            btn.getAttribute('title') ||
+                            (btn.innerText || '').trim(),
+                    };
                 }
 
                 return { clicked: false, reason: 'no-assistant-turn', signature: null };
@@ -646,8 +672,10 @@ async def extract_last_response_via_copy(
             content = await page.evaluate("navigator.clipboard.readText().catch(() => '')")
             if content and content.strip() and content.strip() != str(pre_clipboard).strip():
                 log.info(
-                    "Extracted via copy button (latest-turn): "
-                    f"{len(content)} chars, turn={click_result.get('signature')}"
+                    "Extracted via last visible Copy button: "
+                    f"{len(content)} chars, copies={click_result.get('copyCount')}, "
+                    f"label={click_result.get('label')!r}, "
+                    f"turn={click_result.get('signature')}"
                 )
                 return content.strip()
             log.debug("Clipboard unchanged/empty after latest-turn copy click")

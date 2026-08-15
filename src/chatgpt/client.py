@@ -125,7 +125,7 @@ class ChatGPTClient:
         4. Type message with human-like delays
         5. Click send
         6. Wait for the latest assistant turn to finish in the page
-        7. Press Page Down and click that turn's Copy button
+        7. Press Page Down and click the last visible Copy button on the page
         8. Read the copied response text from the clipboard
 
         Returns ChatResponse with the assistant's reply and metadata.

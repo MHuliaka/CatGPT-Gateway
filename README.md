@@ -155,8 +155,9 @@ endpoints remain stateful for callers that explicitly want to continue a
 browser thread.
 
 For ChatGPT, `/v1/chat/completions` submits through the authenticated browser,
-waits for the newest assistant turn, presses Page Down, and clicks that turn's
-Copy button. It waits 0.8 seconds for the clipboard before reading the response.
+waits for the newest assistant turn, presses Page Down, and clicks the last
+visible Copy button in document order. It waits 0.8 seconds for the clipboard
+before reading the response.
 The gateway then waits 3 seconds, returns to a fresh provider home page, and
 returns the saved result. Browser access remains locked throughout that sequence.
 
