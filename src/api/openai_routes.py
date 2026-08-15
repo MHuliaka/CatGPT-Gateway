@@ -21,7 +21,6 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from src.api.chat_lifecycle import NewChatTimeoutError, start_new_chat
 from src.api.openai_schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -71,25 +70,24 @@ def _get_lock() -> asyncio.Lock:
     return _lock
 
 
+# Track messages in the current thread to prevent thread exhaustion
+_thread_message_count = 0
+_MAX_THREAD_MESSAGES = 8  # Start a new chat after this many requests
 _last_response_time: float = 0.0
 _MIN_MESSAGE_GAP = 3.0  # Minimum seconds between messages (ChatGPT needs cooldown)
 
 
 async def _ensure_fresh_chat() -> None:
-    """Start an isolated browser chat for every OpenAI-compatible request.
+    """Enforce cooldown between messages and start new chat if thread is full.
 
-    OpenAI requests carry their complete conversation in ``messages``. The
-    browser chat is only a transport and must not retain context from an
-    earlier API call. A short cooldown is still enforced because the provider
-    UI may reject rapid-fire submissions.
+    ChatGPT's web UI degrades after ~6-8 messages in a thread (stops
+    generating, copy-button never appears). We preemptively start a
+    new chat after _MAX_THREAD_MESSAGES to prevent this.
+
+    Also enforces a minimum gap between consecutive messages, since
+    ChatGPT's UI may not accept rapid-fire messages properly.
     """
-    global _last_response_time
-
-    # API-backed providers do not need browser cooldowns or chat resets.
-    # Their OpenAI-compatible calls are made statelessly below because each
-    # request already carries its complete conversation history.
-    if not Config.uses_browser():
-        return
+    global _thread_message_count, _last_response_time
 
     # Enforce minimum gap between messages
     if _last_response_time > 0:
@@ -99,55 +97,31 @@ async def _ensure_fresh_chat() -> None:
             log.debug(f"Cooldown: waiting {wait:.1f}s before next message")
             await asyncio.sleep(wait)
 
+    if _thread_message_count < _MAX_THREAD_MESSAGES:
+        return  # Thread is fresh enough — no navigation needed
+
     client = _get_client()
     try:
-        await start_new_chat(client)
-    except NewChatTimeoutError as exc:
-        log.error(str(exc))
-        raise HTTPException(status_code=504, detail=str(exc)) from exc
-    except Exception as exc:
-        log.error(f"Could not start an isolated browser chat: {exc}")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not start an isolated browser chat: {exc}",
-        ) from exc
-
-
-def _record_response_time() -> None:
-    """Record a successful browser response for the inter-request cooldown."""
-    global _last_response_time
-    if not Config.uses_browser():
-        return
-    _last_response_time = time.time()
-
-
-async def _refresh_browser_page(client: ChatGPTClient | ClaudeClient) -> None:
-    """Reload the provider page after its response text has been captured."""
-    refresh_timeout_ms = min(max(Config.NEW_CHAT_TIMEOUT, 1000), 8000)
-    try:
-        await asyncio.wait_for(
-            client.page.reload(
-                # A committed response proves the refresh started. Waiting for
-                # DOMContentLoaded can hang on provider analytics/resources.
-                wait_until="commit",
-                timeout=refresh_timeout_ms,
-            ),
-            timeout=(refresh_timeout_ms + 1000) / 1000,
-        )
+        await client.new_chat()
+        _thread_message_count = 0
+    except Exception as e:
+        log.warning(f"new_chat() failed, retrying once: {e}")
         try:
-            await client.page.wait_for_load_state(
-                "domcontentloaded",
-                timeout=3000,
-            )
-            log.info("Provider page refreshed and ready after response")
-        except Exception:
-            # The refresh itself committed successfully. Do not prolong cleanup
-            # if a third-party resource delays DOM readiness.
-            log.info("Provider page refresh committed after response")
-    except Exception as exc:
-        # Keep the captured model response even if cleanup fails. The next
-        # request's fresh-chat check can recover the browser if needed.
-        log.warning(f"Post-response page refresh failed: {exc}")
+            await asyncio.sleep(2)
+            await client.new_chat()
+            _thread_message_count = 0
+        except Exception as e2:
+            log.error(f"new_chat() retry also failed: {e2}")
+            # Don't raise — continue with current thread rather than failing
+            log.warning("Continuing with current thread despite new_chat failure")
+
+
+def _increment_thread_count() -> None:
+    """Increment the thread message counter after a successful response."""
+    global _thread_message_count, _last_response_time
+    _thread_message_count += 1
+    _last_response_time = time.time()
+    log.debug(f"Thread message count: {_thread_message_count}/{_MAX_THREAD_MESSAGES}")
 
 
 def _resolve_model_id(requested: str | None) -> str:
@@ -251,17 +225,6 @@ def _extract_file_attachments(content) -> list[dict]:
         if data_b64:
             files.append({"filename": filename, "data_b64": data_b64, "mime_type": mime_type})
     return files
-
-
-def _contains_attachment(content) -> bool:
-    """Return whether OpenAI chat/responses content contains an attachment."""
-    if isinstance(content, list):
-        return any(_contains_attachment(item) for item in content)
-    if not isinstance(content, dict):
-        return False
-    if content.get("type") in {"image_url", "file", "input_image", "input_file"}:
-        return True
-    return any(_contains_attachment(value) for value in content.values())
 
 
 async def _download_file(url_or_data: str | dict, download_dir: str = "/tmp/catgpt_files") -> str | None:
@@ -705,7 +668,7 @@ async def create_image(
             f"n={request.n}, size={request.size}, response_format={request.response_format}"
         )
 
-        # Isolate this OpenAI request from every previous browser chat
+        # Start a fresh conversation to avoid thread exhaustion
         await _ensure_fresh_chat()
 
         # Send to ChatGPT
@@ -775,7 +738,7 @@ async def create_image(
             f"{elapsed_ms}ms, format={request.response_format}"
         )
 
-        _record_response_time()
+        _increment_thread_count()
         return ImagesResponse(data=image_data_list)
 
 
@@ -800,22 +763,10 @@ async def create_chat_completion(
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
-    if Config.PROVIDER == "minimax" and any(
-        _contains_attachment(message.content) for message in request.messages
-    ):
-        raise HTTPException(
-            status_code=501,
-            detail="Attachments are not supported by the MiniMax provider.",
-        )
-
     client = _get_client()
     model_id = _resolve_model_id(request.model)
 
-    # Keep the browser lock until the captured response has been followed by
-    # the configured delay and page refresh. Only then return the API response.
-    lock = _get_lock()
-    await lock.acquire()
-    try:
+    async with _get_lock():
         start_time = time.time()
 
         # ── Build the prompt ────────────────────────────────
@@ -860,7 +811,7 @@ async def create_chat_completion(
         if all_attachment_paths:
             log.info(f"Extracted {len(image_paths)} image(s) and {len(file_paths)} file(s) from request")
 
-        # Isolate this OpenAI request from every previous browser chat
+        # Start a fresh conversation to avoid thread exhaustion
         await _ensure_fresh_chat()
 
         # ── Send to provider ───────────────────────────────
@@ -870,14 +821,7 @@ async def create_chat_completion(
                 image_paths=image_paths or None,
                 file_paths=file_paths or None,
                 model=model_id,
-                stateless=not Config.uses_browser(),
             )
-        except TimeoutError as e:
-            log.error(f"Provider response timed out: {e}")
-            raise HTTPException(
-                status_code=504,
-                detail=f"Provider response timed out: {e}",
-            ) from e
         except Exception as e:
             log.error(f"Provider error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Provider error: {str(e)}")
@@ -885,10 +829,10 @@ async def create_chat_completion(
         response_text = result.message
         elapsed_ms = int((time.time() - start_time) * 1000)
 
-        # ── Detect Claude DOM extraction echo ──
+        # ── Detect echo (extraction grabbed sent prompt instead of reply) ──
         _echo_markers = ["[System instruction:", "tool-calling mode", "Available functions:"]
         if (
-            Config.PROVIDER == "claude"
+            Config.uses_browser()
             and response_text
             and has_tool_prompt
             and any(m in response_text for m in _echo_markers)
@@ -955,20 +899,8 @@ async def create_chat_completion(
             f"tokens≈{response.usage.total_tokens}"
         )
 
-        _record_response_time()
-
-        if Config.uses_browser():
-            refresh_delay = max(Config.POST_RESPONSE_REFRESH_DELAY_SECONDS, 0.0)
-            if refresh_delay:
-                log.info(
-                    f"Response captured; waiting {refresh_delay:g}s before page refresh"
-                )
-                await asyncio.sleep(refresh_delay)
-            await _refresh_browser_page(client)
-
+        _increment_thread_count()
         return response
-    finally:
-        lock.release()
 
 
 # ── Responses API (/v1/responses) ───────────────────────────────
@@ -1315,12 +1247,6 @@ async def create_response(request: ResponsesRequest):
     if not request.input:
         raise HTTPException(status_code=400, detail="input cannot be empty")
 
-    if Config.PROVIDER == "minimax" and _contains_attachment(request.input):
-        raise HTTPException(
-            status_code=501,
-            detail="Attachments are not supported by the MiniMax provider.",
-        )
-
     client = _get_client()
     model_id = _resolve_model_id(request.model)
 
@@ -1357,16 +1283,12 @@ async def create_response(request: ResponsesRequest):
             f"prompt={len(prompt)} chars, stream={request.stream}"
         )
 
-        # Isolate this OpenAI request from every previous browser chat
+        # Start a fresh conversation to avoid thread exhaustion
         await _ensure_fresh_chat()
 
         # ── Send to provider ───────────────────────────────
         try:
-            result = await client.send_message(
-                prompt,
-                model=model_id,
-                stateless=not Config.uses_browser(),
-            )
+            result = await client.send_message(prompt, model=model_id)
         except RuntimeError as e:
             err_msg = str(e).lower()
             if "error state" in err_msg or "could not find chat input" in err_msg:
@@ -1376,11 +1298,7 @@ async def create_response(request: ResponsesRequest):
                 if _browser and await _browser.recover_page():
                     # Retry after recovery
                     try:
-                        result = await client.send_message(
-                            prompt,
-                            model=model_id,
-                            stateless=not Config.uses_browser(),
-                        )
+                        result = await client.send_message(prompt, model=model_id)
                     except Exception as e2:
                         log.error(f"Provider error after recovery: {e2}", exc_info=True)
                         raise HTTPException(
@@ -1403,11 +1321,7 @@ async def create_response(request: ResponsesRequest):
                 from src.api.server import _browser
                 if _browser and await _browser.recover_page():
                     try:
-                        result = await client.send_message(
-                            prompt,
-                            model=model_id,
-                            stateless=not Config.uses_browser(),
-                        )
+                        result = await client.send_message(prompt, model=model_id)
                     except Exception as e2:
                         log.error(f"Provider error after crash recovery: {e2}", exc_info=True)
                         raise HTTPException(
@@ -1494,7 +1408,7 @@ async def create_response(request: ResponsesRequest):
             f"tokens≈{resp.usage.total_tokens if resp.usage else 0}"
         )
 
-        _record_response_time()
+        _increment_thread_count()
 
         # ── Stream or return ────────────────────────────────
         if request.stream:
