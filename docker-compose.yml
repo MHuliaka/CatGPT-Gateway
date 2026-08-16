@@ -84,7 +84,7 @@ services:
     # Chromium needs these for sandbox
     security_opt:
       - seccomp=unconfined
-    shm_size: "2gb"
+    shm_size: "8gb"
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
