@@ -14,12 +14,16 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import tempfile
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
+from starlette.datastructures import UploadFile
 
 from src.api.chat_lifecycle import return_home_after_call
 from src.api.openai_schemas import (
@@ -156,6 +160,86 @@ def _get_client() -> ChatGPTClient | ClaudeClient | MiniMaxClient:
     if _client is None:
         raise HTTPException(status_code=503, detail="Client not initialized")
     return _client
+
+
+async def _parse_image_generation_request(
+    http_request: Request,
+) -> tuple[ImageGenerationRequest, list[str], list[str], tempfile.TemporaryDirectory | None]:
+    """Parse JSON or multipart image-generation input.
+
+    Multipart requests may use any file field name. Files whose declared MIME
+    type starts with ``image/`` are forwarded as image inputs; every other
+    upload is forwarded as a generic file input.
+    """
+    content_type = http_request.headers.get("content-type", "").lower()
+
+    try:
+        if content_type.startswith("multipart/form-data"):
+            form = await http_request.form()
+            fields = {
+                name: form.get(name)
+                for name in (
+                    "prompt",
+                    "model",
+                    "n",
+                    "size",
+                    "quality",
+                    "style",
+                    "response_format",
+                    "user",
+                )
+                if form.get(name) is not None
+                and not isinstance(form.get(name), UploadFile)
+            }
+            parsed = ImageGenerationRequest.model_validate(fields)
+        elif not content_type or "application/json" in content_type:
+            parsed = ImageGenerationRequest.model_validate(await http_request.json())
+            return parsed, [], [], None
+        else:
+            raise HTTPException(
+                status_code=415,
+                detail="Content-Type must be application/json or multipart/form-data.",
+            )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_url=False),
+        ) from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Request body is not valid JSON.") from exc
+
+    uploads = [
+        value
+        for _, value in form.multi_items()
+        if isinstance(value, UploadFile)
+    ]
+    if not uploads:
+        return parsed, [], [], None
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="catgpt_image_inputs_")
+    image_paths: list[str] = []
+    file_paths: list[str] = []
+
+    try:
+        for upload in uploads:
+            original_name = Path(upload.filename or "attachment").name
+            safe_name = re.sub(r"[^\w.\-]", "_", original_name) or "attachment"
+            local_path = Path(temp_dir.name) / f"{uuid.uuid4().hex[:12]}_{safe_name}"
+
+            with local_path.open("wb") as destination:
+                while chunk := await upload.read(1024 * 1024):
+                    destination.write(chunk)
+            await upload.close()
+
+            if (upload.content_type or "").lower().startswith("image/"):
+                image_paths.append(str(local_path))
+            else:
+                file_paths.append(str(local_path))
+    except Exception:
+        temp_dir.cleanup()
+        raise
+
+    return parsed, image_paths, file_paths, temp_dir
 
 
 # ── Helpers ─────────────────────────────────────────────────────
@@ -633,9 +717,64 @@ async def list_models() -> ModelListResponse:
     )
 
 
-@openai_router.post("/v1/images/generations", response_model=ImagesResponse)
+@openai_router.post(
+    "/v1/images/generations",
+    response_model=ImagesResponse,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": ImageGenerationRequest.model_json_schema(),
+                },
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["prompt"],
+                        "properties": {
+                            "prompt": {"type": "string"},
+                            "model": {"type": "string", "default": "dall-e-3"},
+                            "n": {"type": "integer", "default": 1},
+                            "size": {"type": "string", "default": "1024x1024"},
+                            "quality": {"type": "string", "default": "standard"},
+                            "style": {"type": "string", "default": "vivid"},
+                            "response_format": {
+                                "type": "string",
+                                "default": "b64_json",
+                            },
+                            "image": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "binary"},
+                            },
+                            "file": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "binary"},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+)
 async def create_image(
+    http_request: Request,
+) -> ImagesResponse:
+    """Accept JSON generation requests and multipart requests with inputs."""
+    request, image_paths, file_paths, input_temp_dir = await _parse_image_generation_request(
+        http_request
+    )
+    try:
+        return await _create_image(request, image_paths, file_paths)
+    finally:
+        if input_temp_dir is not None:
+            input_temp_dir.cleanup()
+
+
+async def _create_image(
     request: ImageGenerationRequest,
+    image_paths: list[str] | None = None,
+    file_paths: list[str] | None = None,
 ) -> ImagesResponse:
     """
     OpenAI-compatible image generation endpoint.
@@ -677,7 +816,8 @@ async def create_image(
 
         log.info(
             f"POST /v1/images/generations — prompt='{request.prompt[:80]}', "
-            f"n={request.n}, size={request.size}, response_format={request.response_format}"
+            f"n={request.n}, size={request.size}, response_format={request.response_format}, "
+            f"images={len(image_paths or [])}, files={len(file_paths or [])}"
         )
 
         # Start a fresh conversation to avoid thread exhaustion
@@ -685,7 +825,11 @@ async def create_image(
 
         # Send to ChatGPT
         try:
-            result = await client.send_message(full_prompt)
+            result = await client.send_message(
+                full_prompt,
+                image_paths=image_paths or None,
+                file_paths=file_paths or None,
+            )
         except Exception as e:
             log.error(f"Provider error during image generation: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Provider error: {str(e)}")

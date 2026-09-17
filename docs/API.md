@@ -338,6 +338,10 @@ Alternative data-URL format:
 **`POST /v1/images/generations`**
 
 Generate images via DALL-E. Only available when `PROVIDER=chatgpt`. Returns HTTP 501 for Claude.
+The endpoint accepts the existing JSON body or `multipart/form-data` when the
+generation should use reference images or supporting files. Every uploaded
+part is attached to the ChatGPT request; `image/*` parts are treated as images
+and all other MIME types as generic files.
 
 ```python
 response = client.images.generate(
@@ -360,6 +364,21 @@ curl -X POST http://localhost:8000/v1/images/generations \
   -H "Authorization: Bearer dummy123" \
   -d '{"prompt": "A cat in space", "n": 1, "response_format": "b64_json"}'
 ```
+
+With image and file inputs:
+
+```bash
+curl -X POST http://localhost:8000/v1/images/generations \
+  -H "Authorization: Bearer dummy123" \
+  -F "prompt=Create a poster based on the reference image and requirements" \
+  -F "image=@reference.png;type=image/png" \
+  -F "file=@requirements.pdf;type=application/pdf" \
+  -F "response_format=b64_json"
+```
+
+File field names are flexible, so repeated `image`, `file`, `input_file`, or
+other file-part names are accepted. The part's MIME type determines whether it
+is forwarded as an image or a generic file.
 
 **Request parameters:**
 
